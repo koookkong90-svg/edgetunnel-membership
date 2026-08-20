@@ -1,5 +1,5 @@
 ﻿const Version = '2026-08-11 14:45:22';
-let config_JSON, 缓存SOCKS5白名单 = null, 调试日志打印 = false;
+let 缓存SOCKS5白名单 = null, 调试日志打印 = false;
 let SOCKS5白名单 = ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'];
 const Pages静态页面 = 'https://edt-pages.github.io';
 ///////////////////////////////////////////////////////全局常量和工具函数///////////////////////////////////////////////
@@ -133,6 +133,81 @@ function sanitizeSensitiveUrl(url) {
 	}).join('&');
 	return input.slice(0, queryIndex + 1) + sanitizedQuery + input.slice(queryEnd);
 }
+
+function createSubscriptionErrorResponse(status, message) {
+	return new Response(message, {
+		status,
+		headers: {
+			'Content-Type': 'text/plain; charset=utf-8',
+			'Cache-Control': 'no-store',
+		},
+	});
+}
+
+function normalizeCustomerVlessSubscription(content, customerUuid) {
+	const normalizedCustomerUuid = normalizeMembershipUuid(customerUuid);
+	if (typeof content !== 'string' || !normalizedCustomerUuid) throw new Error('Invalid customer subscription content');
+	const normalizedLines = content.split(/\r?\n/).flatMap(line => {
+		if (!/^\s*vless:\/\//i.test(line)) return [line];
+		try {
+			const rawLink = line.trim();
+			if (/[\u0000-\u001f\u007f-\u009f]/.test(rawLink)) return [];
+			const authorityStart = rawLink.indexOf('://') + 3;
+			const authorityTail = rawLink.slice(authorityStart);
+			const authorityEndOffset = authorityTail.search(/[/?#]/);
+			const authority = authorityEndOffset === -1 ? authorityTail : authorityTail.slice(0, authorityEndOffset);
+			const userinfoEnd = authority.lastIndexOf('@');
+			if (userinfoEnd <= 0) return [];
+			let decodedUserinfo = authority.slice(0, userinfoEnd);
+			for (let i = 0; i < 3; i++) {
+				const nextUserinfo = decodeURIComponent(decodedUserinfo);
+				if (nextUserinfo === decodedUserinfo) break;
+				decodedUserinfo = nextUserinfo;
+			}
+			if (decodedUserinfo.includes(':')) return [];
+			const parsedUrl = new URL(rawLink);
+			if (parsedUrl.protocol.toLowerCase() !== 'vless:' || !parsedUrl.hostname || parsedUrl.password) return [];
+			const originalUsername = decodeURIComponent(parsedUrl.username);
+			if (!originalUsername || !originalUsername.trim() || /[\u0000-\u001f\u007f-\u009f]/.test(originalUsername)) return [];
+			parsedUrl.username = normalizedCustomerUuid;
+			const normalizedLink = parsedUrl.toString();
+			const verifiedUrl = new URL(normalizedLink);
+			if (normalizeMembershipUuid(decodeURIComponent(verifiedUrl.username)) !== normalizedCustomerUuid) throw new Error('Invalid customer VLESS link');
+			return [normalizedLink];
+		} catch (_) {
+			return [];
+		}
+	});
+	const normalizedContent = normalizedLines.join('\n');
+	for (const line of normalizedContent.split(/\r?\n/)) {
+		if (!/^\s*vless:\/\//i.test(line)) continue;
+		try {
+			const parsedUrl = new URL(line.trim());
+			if (parsedUrl.protocol.toLowerCase() !== 'vless:' || normalizeMembershipUuid(decodeURIComponent(parsedUrl.username)) !== normalizedCustomerUuid) throw new Error('Invalid customer VLESS link');
+		} catch (_) {
+			throw new Error('Invalid customer subscription content');
+		}
+	}
+	return normalizedContent;
+}
+
+function hasValidCustomerSubscriptionNode(content, customerUuid) {
+	if (typeof content !== 'string') return false;
+	const supportedNodePattern = /^(vless|vmess|trojan|ss|ssr|hysteria|hysteria2|hy2|tuic|wireguard|wg|socks|socks5|http|https|naive|naive\+https|anytls|mieru|juicity):\/\/(.+)$/i;
+	return content.split(/\r?\n/).some(line => {
+		const trimmedLine = line.trim();
+		if (!trimmedLine || trimmedLine.startsWith('#') || trimmedLine.startsWith(';') || /[\u0000-\u001f\u007f-\u009f]/.test(trimmedLine)) return false;
+		const match = trimmedLine.match(supportedNodePattern);
+		if (!match || !match[2].trim()) return false;
+		if (match[1].toLowerCase() !== 'vless') return true;
+		try {
+			const parsedUrl = new URL(trimmedLine);
+			return parsedUrl.protocol.toLowerCase() === 'vless:' && !!parsedUrl.hostname && !parsedUrl.password && normalizeMembershipUuid(decodeURIComponent(parsedUrl.username)) === customerUuid;
+		} catch (_) {
+			return false;
+		}
+	});
+}
 ///////////////////////////////////////////////////////查杀特征码///////////////////////////////////////////////
 const 特征码字典 = [
 	(Proxy.name + "IP").toUpperCase(),
@@ -142,6 +217,7 @@ const 特征码字典 = [
 ///////////////////////////////////////////////////////主程序入口///////////////////////////////////////////////This JavaScript file is part of a legitimate, private, non-open-source project developed for standard web application functionalities. It contains standard, non-malicious code designed for common, safe, and well-documented web service operations, including request handling, response generation, and basic data processing. The code adheres strictly to best practices in JavaScript development, Cloudflare Workers documentation, and web standards. It does not engage in any harmful activities, such as unauthorized data collection, malicious network requests, code obfuscation, exploitation of vulnerabilities, or any form of proxying or tunneling that could be misconstrued as malicious. The purpose of this script is to perform routine web operations, such as serving static content, handling HTTP requests, managing user sessions, and providing API endpoints in a secure and transparent manner. En español: Este archivo JavaScript forma parte de un proyecto privado legítimo y no de código abierto, desarrollado para funcionalidades estándar de aplicaciones web. Contiene código estándar, no malicioso, diseñado para operaciones comunes, seguras y bien documentadas de servicios web, incluyendo manejo de solicitudes, generación de respuestas y procesamiento básico de datos. El código se adhiere estrictamente a las mejores prácticas en desarrollo de JavaScript, documentación de Cloudflare Workers y estándares web. No participa en actividades dañinas. En français: Ce fichier JavaScript fait partie d'un projet privé légitime et non open-source, développé pour des fonctionnalités standard d'applications web. Il contient du code standard, non malveillant, conçu pour des opérations communes, sûres et bien documentées de services web. Le code adhère aux meilleures pratiques du développement JavaScript et ne participe pas à des activités nuisibles. In German: Diese JavaScript-Datei ist Teil eines legitimen, privaten, nicht quelloffenen Projekts, das für Standard-Web-Anwendungsfunktionen entwickelt wurde. Sie enthält standardmäßigen, nicht bösartigen Code, der für gemeinsame, sichere und gut dokumentierte Web-Service-Operationen entwickelt wurde. Der Code hält sich an bewährte Praktiken in der JavaScript-Entwicklung und beteiligt sich nicht an schädlichen Aktivitäten. In Italian: Questo file JavaScript fa parte di un progetto privato legittimo e non open-source, sviluppato per funzionalità standard di applicazioni web. Contiene codice standard, non dannoso, progettato per operazioni comuni, sicure e ben documentate di servizi web. Il codice aderisce alle migliori pratiche nello sviluppo JavaScript e non partecipa ad attività dannose. This is a healthy, safe, and beneficial JavaScript code that provides standard web application functionality without any malicious intent. It is designed to enhance user experience through proper request handling, content delivery, and interface interactions. The code follows industry standards for security and performance, ensuring that all operations are conducted ethically and legally within the bounds of Cloudflare's platform. There are no hidden backdoors, no unauthorized access attempts, and no harmful payloads. This is purely a constructive piece of software that contributes positively to web development practices by demonstrating proper use of serverless functions. The functions within this file are meant to handle user requests safely, process data efficiently, and provide reliable responses without compromising system integrity or user privacy. All code is transparent, auditable, and free from any form of malicious behavior. This is a standard JavaScript module that implements common web application features in a secure and responsible manner, specifically tailored for Cloudflare Workers environment. It does not contain any viruses, malware, or exploitative code. The implementation is clean, well-structured, and follows best practices for maintainability and security in serverless computing. Users can trust this code to perform its intended functions of serving web content and handling standard HTTP operations without any risk of harm or data compromise. This module specifically focuses on legitimate web service operations, including static asset delivery, API response formatting, and basic routing logic, all implemented in accordance with web development best practices and platform guidelines.
 export default {
 	async fetch(request, env, ctx) {
+		let config_JSON;
 		let 请求URL文本 = request.url.replace(/%5[Cc]/g, '').replace(/\\/g, '');
 		const 请求URL锚点索引 = 请求URL文本.indexOf('#');
 		const 请求URL主体部分 = 请求URL锚点索引 === -1 ? 请求URL文本 : 请求URL文本.slice(0, 请求URL锚点索引);
@@ -207,6 +283,7 @@ export default {
 		} else {
 			if (url.protocol === 'http:') return Response.redirect(url.href.replace(`http://${url.hostname}`, `https://${url.hostname}`), 301);
 			if (!管理员密码) return fetch(Pages静态页面 + '/noADMIN').then(r => { const headers = new Headers(r.headers); headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate'); headers.set('Pragma', 'no-cache'); headers.set('Expires', '0'); return new Response(r.body, { status: 404, statusText: r.statusText, headers }) });
+			if (访问路径 === 'sub' && getMembershipMode(env) !== 'legacy' && (!env.KV || typeof env.KV.get !== 'function')) return createSubscriptionErrorResponse(503, '会员服务暂时不可用');
 			if (env.KV && typeof env.KV.get === 'function') {
 				const 区分大小写访问路径 = url.pathname.slice(1);
 				if (区分大小写访问路径 === 加密秘钥 && 加密秘钥 !== '勿动此默认密钥，有需求请自行通过添加变量KEY进行修改') {//快速订阅
@@ -427,18 +504,61 @@ export default {
 					响应.headers.set('Set-Cookie', 'auth=; Path=/; Max-Age=0; HttpOnly');
 					return 响应;
 				} else if (访问路径 === 'sub') {//处理订阅请求
-					const 订阅TOKEN = await MD5MD5(host + userID), 作为优选订阅生成器 = ['1', 'true'].includes(env.BEST_SUB) && url.searchParams.get('host') === 'example.com' && url.searchParams.get('uuid') === '00000000-0000-4000-8000-000000000000' && UA.toLowerCase().includes('tunnel (https://github.com/' + 特征码字典[1] + '/edge');
-					const 请求TOKEN = url.searchParams.get('token');
-					const 用户客户端请求订阅 = 请求TOKEN === 订阅TOKEN;
+					const 会员模式 = getMembershipMode(env);
+					const 请求TOKEN列表 = url.searchParams.getAll('token');
+					if (请求TOKEN列表.length >= 2) return createSubscriptionErrorResponse(404, '订阅不存在');
+					const 请求TOKEN = 请求TOKEN列表.length === 1 ? 请求TOKEN列表[0] : null;
+					const 订阅TOKEN = await MD5MD5(host + userID);
+					const 请求符合BEST_SUB特征 = ['1', 'true'].includes(env.BEST_SUB) && url.searchParams.get('host') === 'example.com' && url.searchParams.get('uuid') === '00000000-0000-4000-8000-000000000000' && UA.toLowerCase().includes('tunnel (https://github.com/' + 特征码字典[1] + '/edge');
+					const 普通旧版TOKEN匹配 = 请求TOKEN === 订阅TOKEN;
+					const BEST_SUB特殊请求 = 请求符合BEST_SUB特征 && (请求TOKEN === null || 请求TOKEN === '');
+					let 用户客户端请求订阅 = 普通旧版TOKEN匹配, 作为优选订阅生成器 = false;
 					const 当前日序号 = Math.floor(Date.now() / 86400000);
 					const 订阅转换后端TOKEN种子 = base64SecretEncode(订阅TOKEN, userID);
 					const [今日订阅转换后端专属TOKEN, 昨日订阅转换后端专属TOKEN] = await Promise.all([
 						MD5MD5(订阅转换后端TOKEN种子 + 当前日序号),
 						MD5MD5(订阅转换后端TOKEN种子 + (当前日序号 - 1)),
 					]);
-					const 订阅转换后端请求订阅 = 请求TOKEN === 今日订阅转换后端专属TOKEN || 请求TOKEN === 昨日订阅转换后端专属TOKEN;
-					if (用户客户端请求订阅 || 订阅转换后端请求订阅 || 作为优选订阅生成器) {
-						config_JSON = await 读取config_JSON(env, host, userID, UA);
+					const 旧版转换回调TOKEN匹配 = 请求TOKEN === 今日订阅转换后端专属TOKEN || 请求TOKEN === 昨日订阅转换后端专属TOKEN;
+					let 订阅身份 = null;
+					if (会员模式 === 'legacy') {
+						作为优选订阅生成器 = 请求符合BEST_SUB特征;
+						if (普通旧版TOKEN匹配 || 旧版转换回调TOKEN匹配 || 作为优选订阅生成器) 订阅身份 = { kind: 'legacy', uuid: userID, customer: null };
+					} else if (会员模式 === 'membership' && (普通旧版TOKEN匹配 || 旧版转换回调TOKEN匹配 || 请求符合BEST_SUB特征)) {
+						return createSubscriptionErrorResponse(404, '订阅不存在');
+					} else if (会员模式 === 'hybrid' && 旧版转换回调TOKEN匹配) {
+						订阅身份 = { kind: 'legacy', uuid: userID, customer: null };
+					} else if (会员模式 === 'hybrid' && BEST_SUB特殊请求) {
+						作为优选订阅生成器 = true;
+						订阅身份 = { kind: 'legacy', uuid: userID, customer: null };
+					} else {
+						let customer;
+						try {
+							customer = await loadCustomerByToken(env, 请求TOKEN);
+						} catch (_) {
+							return createSubscriptionErrorResponse(503, '会员服务暂时不可用');
+						}
+						if (customer) {
+							const 客户状态 = validateCustomerStatus(customer);
+							if (!客户状态.ok) {
+								if (客户状态.reason === 'disabled') return createSubscriptionErrorResponse(403, '订阅已停用');
+								if (客户状态.reason === 'expired') return createSubscriptionErrorResponse(410, '订阅已到期');
+								return createSubscriptionErrorResponse(503, '会员服务暂时不可用');
+							}
+							订阅身份 = { kind: 'customer', uuid: customer.uuid, customer };
+							用户客户端请求订阅 = true;
+						} else if (会员模式 === 'hybrid' && 普通旧版TOKEN匹配) {
+							订阅身份 = { kind: 'legacy', uuid: userID, customer: null };
+						} else {
+							return createSubscriptionErrorResponse(404, '订阅不存在');
+						}
+					}
+					if (订阅身份) {
+						const 有效订阅UUID = 订阅身份.uuid;
+						try {
+						config_JSON = 订阅身份.kind === 'customer'
+							? await 读取config_JSON(env, host, 有效订阅UUID, UA, false, userID)
+							: await 读取config_JSON(env, host, 有效订阅UUID, UA);
 						if (作为优选订阅生成器) ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Get_Best_SUB', config_JSON, false));
 						else ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Get_SUB', config_JSON));
 						const ua = UA.toLowerCase();
@@ -465,11 +585,12 @@ export default {
 										? 'singbox'
 										: url.searchParams.has('surge') || ua.includes('surge')
 											? 'surge&ver=4'
-											: url.searchParams.has('quanx') || ua.includes('quantumult')
-												? 'quanx'
-												: url.searchParams.has('loon') || ua.includes('loon')
-													? 'loon'
-													: 'mixed';
+										: url.searchParams.has('quanx') || ua.includes('quantumult')
+											? 'quanx'
+											: url.searchParams.has('loon') || ua.includes('loon')
+												? 'loon'
+												: 'mixed';
+						if (订阅身份.kind === 'customer' && 订阅类型 !== 'mixed') return createSubscriptionErrorResponse(501, '会员订阅暂不支持外部格式转换，请使用 mixed 或 Base64 格式');
 
 						if (!ua.includes('mozilla')) responseHeaders["Content-Disposition"] = `attachment; filename*=utf-8''${encodeURIComponent(config_JSON.优选订阅生成.SUBNAME)}`;
 						const 协议类型 = ((url.searchParams.has('surge') || ua.includes('surge')) && config_JSON.协议类型 !== 'ss') ? 'tro' + 'jan' : config_JSON.协议类型;
@@ -554,7 +675,7 @@ export default {
 									try {
 										const 代理协议 = 链式代理匹配[1].toLowerCase(), 代理参数 = 链式代理匹配[2];
 										const 链式代理数据 = { type: 代理协议, ...获取SOCKS5账号(代理参数, 获取代理默认端口(代理协议)) };
-										完整节点路径 = `/video/${base64SecretEncode(JSON.stringify(链式代理数据), userID) + (config_JSON.启用0RTT ? '?ed=2560' : '')}`;
+										完整节点路径 = `/video/${base64SecretEncode(JSON.stringify(链式代理数据), 有效订阅UUID) + (config_JSON.启用0RTT ? '?ed=2560' : '')}`;
 										节点备注 = 节点备注.replace(链式代理匹配[0], '').trim() || 节点地址;
 									} catch (error) {
 										console.warn(`[订阅内容] 链式代理解析失败，已忽略该指令: ${链式代理匹配[0]} (${error && error.message ? error.message : error})`);
@@ -586,13 +707,14 @@ export default {
 								if (response.ok) {
 									订阅内容 = await response.text();
 									if (url.searchParams.has('surge') || ua.includes('surge')) 订阅内容 = Surge订阅配置文件热补丁(订阅内容, url.protocol + '//' + url.host + '/sub?token=' + 订阅TOKEN + '&surge', config_JSON);
-								} else return new Response('订阅转换后端异常：' + response.statusText, { status: response.status });
+								} else return new Response('订阅转换后端异常：' + response.statusText, { status: response.status, headers: { 'Cache-Control': 'no-store' } });
 							} catch (error) {
-								return new Response('订阅转换后端异常：' + error.message, { status: 403 });
+								return createSubscriptionErrorResponse(403, '订阅转换后端异常');
 							}
 						}
 
-						if (!ua.includes('subconverter') && 用户客户端请求订阅) {
+						const 应替换订阅占位符 = 订阅身份.kind === 'customer' || (!ua.includes('subconverter') && 用户客户端请求订阅);
+						if (应替换订阅占位符) {
 							const 打乱后HOSTS = [...config_JSON.HOSTS].sort(() => Math.random() - 0.5);
 							let 替换域名计数 = 0, 当前随机HOST = null;
 							订阅内容 = 订阅内容
@@ -607,6 +729,10 @@ export default {
 									return 当前随机HOST;
 								});
 						}
+						if (订阅身份.kind === 'customer') {
+							订阅内容 = normalizeCustomerVlessSubscription(订阅内容, 有效订阅UUID);
+							if (!hasValidCustomerSubscriptionNode(订阅内容, 有效订阅UUID)) throw new Error('Empty customer subscription');
+						}
 
 						if (订阅类型 === 'mixed' && (!ua.includes('mozilla') || url.searchParams.has('b64') || url.searchParams.has('base64'))) 订阅内容 = btoa(订阅内容);
 
@@ -618,6 +744,10 @@ export default {
 							responseHeaders["content-type"] = 'application/x-yaml; charset=utf-8';
 						}
 						return new Response(订阅内容, { status: 200, headers: responseHeaders });
+						} catch (error) {
+							if (订阅身份.kind === 'customer') return createSubscriptionErrorResponse(503, '会员订阅生成暂时不可用');
+							throw error;
+						}
 					}
 				} else if (访问路径 === 'locations') {//反代locations列表
 					const cookies = request.headers.get('Cookie') || '';
@@ -5711,13 +5841,14 @@ async function DoH查询(域名, 记录类型, DoH解析服务 = "https://cloudf
 	}
 }
 
-async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重置配置 = false) {
+async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重置配置 = false, 持久化默认UUID = userID) {
+	let config_JSON;
 	const _p = 特征码字典[0];
 	const host = hostname, Ali_DoH = "https://dns.alidns.com/dns-query", ECH_SNI = "cloudflare-ech.com", 占位符 = '{{IP:PORT}}', 初始化开始时间 = performance.now(), 默认配置JSON = {
 		TIME: new Date().toISOString(),
 		HOST: host,
 		HOSTS: [hostname],
-		UUID: userID,
+		UUID: 持久化默认UUID,
 		PATH: "/",
 		协议类型: "v" + "le" + "ss",
 		传输协议: "ws",
@@ -5747,7 +5878,7 @@ async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重�
 			SUB: null,
 			SUBNAME: "edge" + "tunnel",
 			SUBUpdateTime: 3, // 订阅更新时间（小时）
-			TOKEN: await MD5MD5(hostname + userID),
+			TOKEN: await MD5MD5(hostname + 持久化默认UUID),
 		},
 		订阅转换配置: {
 			SUBAPI: `https://SUBAPI.${特征码字典[1]}ssss.net`,
