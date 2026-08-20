@@ -6,7 +6,133 @@ const Pages静态页面 = 'https://edt-pages.github.io';
 const WS早期数据最大字节 = 8 * 1024, WS早期数据最大头长度 = Math.ceil(WS早期数据最大字节 * 4 / 3) + 4;
 const 上行合包目标字节 = 20 * 1024, 上行队列最大字节 = 16 * 1024 * 1024, 上行队列最大条目 = 4096;
 const 下行Grain包字节 = 32 * 1024, 下行Grain尾部阈值 = 512, 下行Grain低水位字节 = Math.max(4096, 下行Grain尾部阈值 * 12), 下行Grain最大等待轮次 = 4;
+const MEMBERSHIP_UUID_KEY_PREFIX = 'membership:uuid:', MEMBERSHIP_TOKEN_KEY_PREFIX = 'membership:token:';
+const MEMBERSHIP_MODES = new Set(['legacy', 'hybrid', 'membership']);
 let TCP并发拨号数 = 2, 反代并发拨号数 = 1, 预加载竞速拨号 = false;
+
+function getMembershipMode(env) {
+	const mode = typeof env?.MEMBERSHIP_MODE === 'string' ? env.MEMBERSHIP_MODE.trim().toLowerCase() : '';
+	return MEMBERSHIP_MODES.has(mode) ? mode : 'legacy';
+}
+
+async function hashMembershipToken(rawToken) {
+	if (typeof rawToken !== 'string' || rawToken.length === 0) return null;
+	const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(rawToken));
+	return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function normalizeMembershipUuid(uuid) {
+	if (typeof uuid !== 'string') return null;
+	const normalized = uuid.trim().toLowerCase();
+	return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(normalized) ? normalized : null;
+}
+
+function parseMembershipCustomer(rawCustomer) {
+	let customer = rawCustomer;
+	if (typeof rawCustomer === 'string') {
+		try {
+			customer = JSON.parse(rawCustomer);
+		} catch (_) {
+			throw new Error('Invalid membership customer record');
+		}
+	}
+
+	const normalizedUuid = normalizeMembershipUuid(customer?.uuid);
+	const valid = customer && typeof customer === 'object' && !Array.isArray(customer)
+		&& customer.schemaVersion === 1
+		&& typeof customer.customerId === 'string' && customer.customerId.length > 0 && customer.customerId === customer.customerId.trim()
+		&& normalizedUuid !== null && customer.uuid === normalizedUuid
+		&& typeof customer.tokenHash === 'string' && /^[0-9a-f]{64}$/.test(customer.tokenHash)
+		&& typeof customer.enabled === 'boolean'
+		&& Number.isSafeInteger(customer.expiresAt) && customer.expiresAt >= 0
+		&& Number.isSafeInteger(customer.updatedAt) && customer.updatedAt >= 0
+		&& Number.isSafeInteger(customer.revision) && customer.revision >= 1;
+	if (!valid) throw new Error('Invalid membership customer record');
+
+	return {
+		schemaVersion: customer.schemaVersion,
+		customerId: customer.customerId,
+		uuid: normalizedUuid,
+		tokenHash: customer.tokenHash,
+		enabled: customer.enabled,
+		expiresAt: customer.expiresAt,
+		updatedAt: customer.updatedAt,
+		revision: customer.revision,
+	};
+}
+
+async function loadCustomerByToken(env, rawToken) {
+	const tokenHash = await hashMembershipToken(rawToken);
+	if (!tokenHash) return null;
+	if (!env?.KV || typeof env.KV.get !== 'function') throw new Error('Membership KV is unavailable');
+	let rawCustomer;
+	try {
+		rawCustomer = await env.KV.get(MEMBERSHIP_TOKEN_KEY_PREFIX + tokenHash);
+	} catch (_) {
+		throw new Error('Membership KV lookup failed');
+	}
+	if (rawCustomer === null || rawCustomer === undefined) return null;
+	const customer = parseMembershipCustomer(rawCustomer);
+	if (customer.tokenHash !== tokenHash) throw new Error('Invalid membership customer record');
+	return customer;
+}
+
+async function loadCustomerByUuid(env, uuid) {
+	const normalizedUuid = normalizeMembershipUuid(uuid);
+	if (!normalizedUuid) return null;
+	if (!env?.KV || typeof env.KV.get !== 'function') throw new Error('Membership KV is unavailable');
+	let rawCustomer;
+	try {
+		rawCustomer = await env.KV.get(MEMBERSHIP_UUID_KEY_PREFIX + normalizedUuid);
+	} catch (_) {
+		throw new Error('Membership KV lookup failed');
+	}
+	if (rawCustomer === null || rawCustomer === undefined) return null;
+	const customer = parseMembershipCustomer(rawCustomer);
+	if (customer.uuid !== normalizedUuid) throw new Error('Invalid membership customer record');
+	return customer;
+}
+
+function validateCustomerStatus(customer, now = Date.now()) {
+	let parsedCustomer;
+	try {
+		parsedCustomer = parseMembershipCustomer(customer);
+	} catch (_) {
+		return { ok: false, reason: 'invalid_record' };
+	}
+	if (!Number.isSafeInteger(now) || now < 0) return { ok: false, reason: 'invalid_time' };
+	if (parsedCustomer.enabled !== true) return { ok: false, reason: 'disabled' };
+	if (now >= parsedCustomer.expiresAt) return { ok: false, reason: 'expired' };
+	return { ok: true, reason: null };
+}
+
+function sanitizeSensitiveUrl(url) {
+	const input = url instanceof URL ? url.toString() : String(url || '');
+	const queryIndex = input.indexOf('?'), fragmentIndex = input.indexOf('#');
+	if (queryIndex === -1 || (fragmentIndex !== -1 && fragmentIndex < queryIndex)) return input;
+	const queryEnd = fragmentIndex === -1 ? input.length : fragmentIndex;
+	const query = input.slice(queryIndex + 1, queryEnd);
+	const isSensitiveParameterName = (rawName) => {
+		let decodedName = rawName.replace(/\+/g, ' ');
+		for (let i = 0; i < 3; i++) {
+			try {
+				const nextName = decodeURIComponent(decodedName);
+				if (nextName === decodedName) break;
+				decodedName = nextName;
+			} catch (_) {
+				return rawName.includes('%');
+			}
+		}
+		return decodedName.toLowerCase() === 'token';
+	};
+	const sanitizedQuery = query.split('&').map(parameter => {
+		const separatorIndex = parameter.indexOf('=');
+		const rawName = separatorIndex === -1 ? parameter : parameter.slice(0, separatorIndex);
+		if (separatorIndex === -1 || !isSensitiveParameterName(rawName)) return parameter;
+		return parameter.slice(0, separatorIndex + 1) + '[REDACTED]';
+	}).join('&');
+	return input.slice(0, queryIndex + 1) + sanitizedQuery + input.slice(queryEnd);
+}
 ///////////////////////////////////////////////////////查杀特征码///////////////////////////////////////////////
 const 特征码字典 = [
 	(Proxy.name + "IP").toUpperCase(),
@@ -5326,7 +5452,8 @@ function Surge订阅配置文件热补丁(content, url, config_JSON) {
 async function 请求日志记录(env, request, 访问IP, 请求类型 = "Get_SUB", config_JSON, 是否写入KV日志 = true) {
 	try {
 		const 当前时间 = new Date();
-		const 日志内容 = { TYPE: 请求类型, IP: 访问IP, ASN: `AS${request.cf.asn || '0'} ${request.cf.asOrganization || 'Unknown'}`, CC: `${request.cf.country || 'N/A'} ${request.cf.city || 'N/A'}`, URL: request.url, UA: request.headers.get('User-Agent') || 'Unknown', TIME: 当前时间.getTime() };
+		const 安全请求URL = sanitizeSensitiveUrl(request.url);
+		const 日志内容 = { TYPE: 请求类型, IP: 访问IP, ASN: `AS${request.cf.asn || '0'} ${request.cf.asOrganization || 'Unknown'}`, CC: `${request.cf.country || 'N/A'} ${request.cf.city || 'N/A'}`, URL: 安全请求URL, UA: request.headers.get('User-Agent') || 'Unknown', TIME: 当前时间.getTime() };
 		if (config_JSON.TG.启用) {
 			try {
 				const TG_TXT = await env.KV.get('tg.json');
@@ -5365,7 +5492,7 @@ async function 请求日志记录(env, request, 访问IP, 请求类型 = "Get_SU
 				if (!Array.isArray(日志数组)) { 日志数组 = [日志内容] }
 				else if (请求类型 !== "Get_SUB") {
 					const 三十分钟前时间戳 = 当前时间.getTime() - 30 * 60 * 1000;
-					if (日志数组.some(log => log.TYPE !== "Get_SUB" && log.IP === 访问IP && log.URL === request.url && log.UA === (request.headers.get('User-Agent') || 'Unknown') && log.TIME >= 三十分钟前时间戳)) return;
+					if (日志数组.some(log => log.TYPE !== "Get_SUB" && log.IP === 访问IP && log.URL === 安全请求URL && log.UA === (request.headers.get('User-Agent') || 'Unknown') && log.TIME >= 三十分钟前时间戳)) return;
 					日志数组.push(日志内容);
 					while (JSON.stringify(日志数组, null, 2).length > KV容量限制 * 1024 * 1024 && 日志数组.length > 0) 日志数组.shift();
 				} else {

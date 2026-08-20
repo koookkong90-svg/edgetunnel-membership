@@ -121,6 +121,7 @@
 | **ADMIN** | ✅ | `123456` | 后台管理面板登录密码 |
 | **KEY** | ❌ | `CMLiussss` | 快速订阅路径密钥，访问 `/CMLiussss` 即可快速获取节点 |
 | **UUID** | ❌ | `90cd4a77-141a-43c9-991b-08263cfe9c10` | 强制固定UUID，只支持**UUIDv4**标准格式 |
+| **MEMBERSHIP_MODE** | ❌ | `legacy` | 会员模式开关，支持 `legacy`、`hybrid`、`membership`；未设置或值非法时使用 `legacy`。当前阶段仅提供会员基础设施，尚未接入订阅与连接鉴权 |
 | **PROXYIP** | ❌ | `proxyip.cmliussss.net:443` | 全局自定义反代 IP  |
 | **URL** | ❌ | `https://cloudflare-error-page-3th.pages.dev` | 默认主页伪装地址（可填写网页 URL 或 `1101`） |
 | **GO2SOCKS5** | ❌ | `blog.cmliussss.com`,`*.ip111.cn`,`*google.com` | 强制走 SOCKS5 的名单 (`*` 为全局，域名用逗号分隔) |
