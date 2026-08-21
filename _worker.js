@@ -1,4 +1,6 @@
 ﻿const Version = '2026-08-11 14:45:22';
+import { renderAdminMembersPage } from './admin-members.js';
+
 let 缓存SOCKS5白名单 = null, 调试日志打印 = false;
 let SOCKS5白名单 = ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'];
 const Pages静态页面 = 'https://edt-pages.github.io';
@@ -761,7 +763,7 @@ export default {
 					if (会员管理路由.isAdminApi) return createAdminApiResponse({ error: { code: 'unauthorized', message: 'Authentication required' } }, 401);
 					return new Response('重定向中...', { status: 302, headers: { 'Location': '/login' } });
 				}
-				if (会员管理路由.route === 'members_page') return createAdminApiResponse({ error: { code: 'not_implemented', message: 'Membership admin page is not implemented yet' } }, 501);
+				if (会员管理路由.route === 'members_page') return renderAdminMembersPage();
 				if (会员管理路由.route) return await handleAdminCustomerApi(request, env, 会员管理路由, { host, userID });
 				if (会员管理路由.isAdminApi) return createAdminApiResponse({ error: { code: 'not_found', message: 'Admin API route not found' } }, 404);
 			}
