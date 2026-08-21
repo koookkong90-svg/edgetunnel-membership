@@ -15,6 +15,46 @@ function getMembershipMode(env) {
 	return MEMBERSHIP_MODES.has(mode) ? mode : 'legacy';
 }
 
+function getAdminAuthCookie(request) {
+	const cookies = request.headers.get('Cookie') || '';
+	const authCookie = cookies.split(';').find(cookie => cookie.trim().startsWith('auth='));
+	return authCookie ? authCookie.trim().slice('auth='.length).split('=')[0] : undefined;
+}
+
+async function isAdminAuthenticated(request, userAgent, encryptionKey, adminPassword) {
+	const authCookie = getAdminAuthCookie(request);
+	return !!authCookie && authCookie === await MD5MD5(userAgent + encryptionKey + adminPassword);
+}
+
+function createAdminApiResponse(body, status = 200) {
+	return new Response(JSON.stringify(body), {
+		status,
+		headers: {
+			'Content-Type': 'application/json;charset=utf-8',
+			'Cache-Control': 'no-store',
+		},
+	});
+}
+
+function getMembershipAdminRoute(pathname) {
+	const segments = String(pathname || '').split('/');
+	if (segments[0] === '') segments.shift();
+	const normalizedSegments = segments.map(segment => segment.toLowerCase());
+	const isAdminApi = normalizedSegments[0] === 'admin' && normalizedSegments[1] === 'api';
+	let route = null;
+	if (normalizedSegments.length === 2 && normalizedSegments[0] === 'admin' && normalizedSegments[1] === 'members') route = 'members_page';
+	else if (normalizedSegments.length === 3 && isAdminApi && normalizedSegments[2] === 'customers') route = 'customers';
+	else if (normalizedSegments.length === 5 && isAdminApi && normalizedSegments[2] === 'customers' && ['renew', 'toggle'].includes(normalizedSegments[4])) {
+		let customerId = null;
+		try {
+			const decodedCustomerId = decodeURIComponent(segments[3]);
+			if (/^cus_[A-Za-z0-9_-]{16,128}$/.test(decodedCustomerId)) customerId = decodedCustomerId;
+		} catch (_) { }
+		if (customerId) route = normalizedSegments[4];
+	}
+	return { isAdminApi, route };
+}
+
 async function hashMembershipToken(rawToken) {
 	if (typeof rawToken !== 'string' || rawToken.length === 0) return null;
 	const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(rawToken));
@@ -284,16 +324,25 @@ export default {
 			if (url.protocol === 'http:') return Response.redirect(url.href.replace(`http://${url.hostname}`, `https://${url.hostname}`), 301);
 			if (!管理员密码) return fetch(Pages静态页面 + '/noADMIN').then(r => { const headers = new Headers(r.headers); headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate'); headers.set('Pragma', 'no-cache'); headers.set('Expires', '0'); return new Response(r.body, { status: 404, statusText: r.statusText, headers }) });
 			if (访问路径 === 'sub' && getMembershipMode(env) !== 'legacy' && (!env.KV || typeof env.KV.get !== 'function')) return createSubscriptionErrorResponse(503, '会员服务暂时不可用');
+			const 区分大小写访问路径 = url.pathname.slice(1);
+			if (访问路径 === 'admin' || 访问路径.startsWith('admin/')) {
+				const 会员管理路由 = getMembershipAdminRoute(new URL(request.url).pathname);
+				const 管理员已认证 = await isAdminAuthenticated(request, UA, 加密秘钥, 管理员密码);
+				if (!管理员已认证) {
+					if (会员管理路由.isAdminApi) return createAdminApiResponse({ error: { code: 'unauthorized', message: 'Authentication required' } }, 401);
+					return new Response('重定向中...', { status: 302, headers: { 'Location': '/login' } });
+				}
+				if (会员管理路由.route === 'members_page') return createAdminApiResponse({ error: { code: 'not_implemented', message: 'Membership admin page is not implemented yet' } }, 501);
+				if (会员管理路由.route) return createAdminApiResponse({ error: { code: 'not_implemented', message: 'Membership admin API is not implemented yet' } }, 501);
+				if (会员管理路由.isAdminApi) return createAdminApiResponse({ error: { code: 'not_found', message: 'Admin API route not found' } }, 404);
+			}
 			if (env.KV && typeof env.KV.get === 'function') {
-				const 区分大小写访问路径 = url.pathname.slice(1);
 				if (区分大小写访问路径 === 加密秘钥 && 加密秘钥 !== '勿动此默认密钥，有需求请自行通过添加变量KEY进行修改') {//快速订阅
 					const params = new URLSearchParams(url.search);
 					params.set('token', await MD5MD5(host + userID));
 					return new Response('重定向中...', { status: 302, headers: { 'Location': `/sub?${params.toString()}` } });
 				} else if (访问路径 === 'login') {//处理登录页面和登录请求
-					const cookies = request.headers.get('Cookie') || '';
-					const authCookie = cookies.split(';').find(c => c.trim().startsWith('auth='))?.split('=')[1];
-					if (authCookie == await MD5MD5(UA + 加密秘钥 + 管理员密码)) return new Response('重定向中...', { status: 302, headers: { 'Location': '/admin' } });
+					if (await isAdminAuthenticated(request, UA, 加密秘钥, 管理员密码)) return new Response('重定向中...', { status: 302, headers: { 'Location': '/admin' } });
 					if (request.method === 'POST') {
 						const formData = await request.text();
 						const params = new URLSearchParams(formData);
@@ -307,10 +356,6 @@ export default {
 					}
 					return fetch(Pages静态页面 + '/login');
 				} else if (访问路径 === 'admin' || 访问路径.startsWith('admin/')) {//验证cookie后响应管理页面
-					const cookies = request.headers.get('Cookie') || '';
-					const authCookie = cookies.split(';').find(c => c.trim().startsWith('auth='))?.split('=')[1];
-					// 没有cookie或cookie错误，跳转到/login页面
-					if (!authCookie || authCookie !== await MD5MD5(UA + 加密秘钥 + 管理员密码)) return new Response('重定向中...', { status: 302, headers: { 'Location': '/login' } });
 					if (访问路径 === 'admin/log.json') {// 读取日志内容
 						const 读取日志内容 = await env.KV.get('log.json') || '[]';
 						return new Response(读取日志内容, { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
@@ -750,9 +795,7 @@ export default {
 						}
 					}
 				} else if (访问路径 === 'locations') {//反代locations列表
-					const cookies = request.headers.get('Cookie') || '';
-					const authCookie = cookies.split(';').find(c => c.trim().startsWith('auth='))?.split('=')[1];
-					if (authCookie && authCookie == await MD5MD5(UA + 加密秘钥 + 管理员密码)) return fetch(new Request('https://speed.cloudflare.com/locations', { headers: { 'Referer': 'https://speed.cloudflare.com/' } }));
+					if (await isAdminAuthenticated(request, UA, 加密秘钥, 管理员密码)) return fetch(new Request('https://speed.cloudflare.com/locations', { headers: { 'Referer': 'https://speed.cloudflare.com/' } }));
 				} else if (访问路径 === 'robots.txt') return new Response('User-agent: *\nDisallow: /', { status: 200, headers: { 'Content-Type': 'text/plain; charset=UTF-8' } });
 			} else if (!envUUID) return fetch(Pages静态页面 + '/noKV').then(r => { const headers = new Headers(r.headers); headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate'); headers.set('Pragma', 'no-cache'); headers.set('Expires', '0'); return new Response(r.body, { status: 404, statusText: r.statusText, headers }) });
 		}
