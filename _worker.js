@@ -186,6 +186,23 @@ async function loadCustomerByUuid(env, uuid) {
 	return customer;
 }
 
+async function authenticateVlessUuid(env, candidateUuid, legacyUuid) {
+	const normalizedCandidateUuid = normalizeMembershipUuid(candidateUuid);
+	const normalizedLegacyUuid = normalizeMembershipUuid(legacyUuid);
+	if (!normalizedCandidateUuid || !normalizedLegacyUuid) return null;
+	const membershipMode = getMembershipMode(env);
+	if (normalizedCandidateUuid === normalizedLegacyUuid) {
+		return membershipMode === 'membership' ? null : { kind: 'legacy', customerId: null, uuid: normalizedLegacyUuid };
+	}
+	if (membershipMode === 'legacy') return null;
+	try {
+		const customer = await loadCustomerByUuid(env, normalizedCandidateUuid);
+		return customer ? { kind: 'customer', customerId: customer.customerId, uuid: customer.uuid } : null;
+	} catch (_) {
+		return null;
+	}
+}
+
 function validateCustomerStatus(customer, now = Date.now()) {
 	let parsedCustomer;
 	try {
@@ -619,7 +636,7 @@ function normalizeCustomerVlessSubscription(content, customerUuid) {
 	const normalizedCustomerUuid = normalizeMembershipUuid(customerUuid);
 	if (typeof content !== 'string' || !normalizedCustomerUuid) throw new Error('Invalid customer subscription content');
 	const normalizedLines = content.split(/\r?\n/).flatMap(line => {
-		if (!/^\s*vless:\/\//i.test(line)) return [line];
+		if (!/^\s*vless:\/\//i.test(line)) return /^\s*[a-z][a-z0-9+.-]*:\/\//i.test(line) ? [] : [line];
 		try {
 			const rawLink = line.trim();
 			if (/[\u0000-\u001f\u007f-\u009f]/.test(rawLink)) return [];
@@ -637,13 +654,14 @@ function normalizeCustomerVlessSubscription(content, customerUuid) {
 			}
 			if (decodedUserinfo.includes(':')) return [];
 			const parsedUrl = new URL(rawLink);
-			if (parsedUrl.protocol.toLowerCase() !== 'vless:' || !parsedUrl.hostname || parsedUrl.password) return [];
+			const transportTypes = parsedUrl.searchParams.getAll('type').map(value => value.toLowerCase());
+			if (parsedUrl.protocol.toLowerCase() !== 'vless:' || !parsedUrl.hostname || parsedUrl.password || transportTypes.length !== 1 || transportTypes[0] !== 'ws') return [];
 			const originalUsername = decodeURIComponent(parsedUrl.username);
 			if (!originalUsername || !originalUsername.trim() || /[\u0000-\u001f\u007f-\u009f]/.test(originalUsername)) return [];
 			parsedUrl.username = normalizedCustomerUuid;
 			const normalizedLink = parsedUrl.toString();
 			const verifiedUrl = new URL(normalizedLink);
-			if (normalizeMembershipUuid(decodeURIComponent(verifiedUrl.username)) !== normalizedCustomerUuid) throw new Error('Invalid customer VLESS link');
+			if (normalizeMembershipUuid(decodeURIComponent(verifiedUrl.username)) !== normalizedCustomerUuid || verifiedUrl.searchParams.getAll('type').length !== 1 || verifiedUrl.searchParams.get('type')?.toLowerCase() !== 'ws') throw new Error('Invalid customer VLESS link');
 			return [normalizedLink];
 		} catch (_) {
 			return [];
@@ -654,7 +672,7 @@ function normalizeCustomerVlessSubscription(content, customerUuid) {
 		if (!/^\s*vless:\/\//i.test(line)) continue;
 		try {
 			const parsedUrl = new URL(line.trim());
-			if (parsedUrl.protocol.toLowerCase() !== 'vless:' || normalizeMembershipUuid(decodeURIComponent(parsedUrl.username)) !== normalizedCustomerUuid) throw new Error('Invalid customer VLESS link');
+			if (parsedUrl.protocol.toLowerCase() !== 'vless:' || normalizeMembershipUuid(decodeURIComponent(parsedUrl.username)) !== normalizedCustomerUuid || parsedUrl.searchParams.getAll('type').length !== 1 || parsedUrl.searchParams.get('type')?.toLowerCase() !== 'ws') throw new Error('Invalid customer VLESS link');
 		} catch (_) {
 			throw new Error('Invalid customer subscription content');
 		}
@@ -664,16 +682,12 @@ function normalizeCustomerVlessSubscription(content, customerUuid) {
 
 function hasValidCustomerSubscriptionNode(content, customerUuid) {
 	if (typeof content !== 'string') return false;
-	const supportedNodePattern = /^(vless|vmess|trojan|ss|ssr|hysteria|hysteria2|hy2|tuic|wireguard|wg|socks|socks5|http|https|naive|naive\+https|anytls|mieru|juicity):\/\/(.+)$/i;
 	return content.split(/\r?\n/).some(line => {
 		const trimmedLine = line.trim();
 		if (!trimmedLine || trimmedLine.startsWith('#') || trimmedLine.startsWith(';') || /[\u0000-\u001f\u007f-\u009f]/.test(trimmedLine)) return false;
-		const match = trimmedLine.match(supportedNodePattern);
-		if (!match || !match[2].trim()) return false;
-		if (match[1].toLowerCase() !== 'vless') return true;
 		try {
 			const parsedUrl = new URL(trimmedLine);
-			return parsedUrl.protocol.toLowerCase() === 'vless:' && !!parsedUrl.hostname && !parsedUrl.password && normalizeMembershipUuid(decodeURIComponent(parsedUrl.username)) === customerUuid;
+			return parsedUrl.protocol.toLowerCase() === 'vless:' && !!parsedUrl.hostname && !parsedUrl.password && normalizeMembershipUuid(decodeURIComponent(parsedUrl.username)) === customerUuid && parsedUrl.searchParams.getAll('type').length === 1 && parsedUrl.searchParams.get('type')?.toLowerCase() === 'ws';
 		} catch (_) {
 			return false;
 		}
@@ -740,7 +754,7 @@ export default {
 		} else if (管理员密码 && upgradeHeader === 'websocket') {// WebSocket代理
 			const 反代上下文 = await 反代参数获取(url, userID, 默认反代IP, 默认反代兜底);
 			log(`[WebSocket] 命中请求: ${url.pathname}${url.search}`);
-			return await 处理WS请求(request, userID, url, 反代上下文);
+			return await 处理WS请求(request, userID, url, 反代上下文, env);
 		} else if (管理员密码 && !访问路径.startsWith('admin/') && 访问路径 !== 'login' && request.method === 'POST') {// gRPC/叉HTTP代理
 			const 反代上下文 = await 反代参数获取(url, userID, 默认反代IP, 默认反代兜底);
 			const { 头: 本机Padding头, 键: 本机Padding键 } = 获取叉HTTPPadding标识(userID);
@@ -1971,19 +1985,23 @@ async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}) {
 	}), { status: 200, headers: grpcHeaders });
 }
 
-function 是有效WS早期数据(bytes, token) {
+function 是有效WS早期数据(bytes, token, membershipMode = 'legacy') {
 	if (!bytes?.byteLength) return false;
-	if (bytes.byteLength >= 18 && UUID字节匹配(bytes, 1, token)) return true;
-	if (bytes.byteLength < 58 || bytes[56] !== 0x0d || bytes[57] !== 0x0a) return false;
-
-	const trojanPassword = sha224(token);
-	for (let i = 0; i < 56; i++) {
-		if (bytes[i] !== trojanPassword.charCodeAt(i)) return false;
+	const candidateUuid = bytes.byteLength >= 18 ? 提取魏烈思UUID(bytes) : null;
+	if (candidateUuid) {
+		return membershipMode === 'legacy' ? candidateUuid === normalizeMembershipUuid(token) : true;
 	}
-	return true;
+	if (bytes.byteLength >= 58 && bytes[56] === 0x0d && bytes[57] === 0x0a) {
+		const trojanPassword = sha224(token);
+		for (let i = 0; i < 56; i++) {
+			if (bytes[i] !== trojanPassword.charCodeAt(i)) return false;
+		}
+		return true;
+	}
+	return membershipMode !== 'legacy' && bytes.byteLength >= 18;
 }
 
-function 解码WS早期数据(header, token) {
+function 解码WS早期数据(header, token, membershipMode = 'legacy') {
 	if (!header) return null;
 	if (header.length > WS早期数据最大头长度) throw new Error('early data is too large');
 
@@ -2009,11 +2027,11 @@ function 解码WS早期数据(header, token) {
 	}
 
 	if (bytes.byteLength > WS早期数据最大字节) throw new Error('early data is too large');
-	return 是有效WS早期数据(bytes, token) ? bytes : null;
+	return 是有效WS早期数据(bytes, token, membershipMode) ? bytes : null;
 }
 
 ///////////////////////////////////////////////////////////////////////WS传输数据///////////////////////////////////////////////
-async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}) {
+async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}, env = {}) {
 	const WS套接字对 = new WebSocketPair();
 	const [clientSock, serverSock] = Object.values(WS套接字对);
 	try { (/** @type {any} */ (serverSock)).accept({ allowHalfOpen: true }) }
@@ -2031,6 +2049,7 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}) {
 	let WS显式传输停止接收 = false, WS显式传输失败 = false, WS显式传输收尾已入队 = false;
 	let WS显式队列字节 = 0, WS显式队列条目 = 0;
 	let 判断协议类型 = null, 当前写入Socket = null, 远端写入器 = null;
+	let VLESS连接身份 = null;
 	let ss上下文 = null, ss初始化任务 = null;
 	let WS本地测速模式 = false, WS本地测速回包Socket = null;
 	let WS本地测速请求缓存 = new Uint8Array(0);
@@ -2411,7 +2430,10 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}) {
 			判断是否是木马 = false;
 			当前块字节 = 当前块字节 || 数据转Uint8Array(chunk);
 			const bytes = 当前块字节;
-			const 解析结果 = 解析魏烈思请求(bytes, yourUUID);
+			const 候选UUID = 提取魏烈思UUID(bytes);
+			VLESS连接身份 = await authenticateVlessUuid(env, 候选UUID, yourUUID);
+			if (!VLESS连接身份) throw new Error('VLESS authentication failed');
+			const 解析结果 = 解析魏烈思请求(bytes, VLESS连接身份.uuid);
 			if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid 魏烈思 request');
 			const { port, hostname, version, isUDP, rawClientData } = 解析结果;
 			const respHeader = new Uint8Array([version, 0]);
@@ -2502,7 +2524,7 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}) {
 	// SS 模式下禁用 sec-websocket-protocol early-data，避免把子协议值（如 "binary"）误当作 base64 数据注入首包导致 AEAD 解密失败。
 	if (!SS模式禁用EarlyData && earlyDataHeader) {
 		try {
-			const bytes = 解码WS早期数据(earlyDataHeader, yourUUID);
+			const bytes = 解码WS早期数据(earlyDataHeader, yourUUID, getMembershipMode(env));
 			if (bytes?.byteLength) 入队WS显式传输(bytes.buffer);
 		} catch (error) {
 			处理WS显式传输错误(error);
@@ -2685,6 +2707,14 @@ function UUID字节匹配(data, offset, uuid) {
 		if (data[offset + i] !== expected[i]) return false;
 	}
 	return true;
+}
+
+function 提取魏烈思UUID(chunk) {
+	const data = 数据转Uint8Array(chunk);
+	if (data.byteLength < 17) return null;
+	let hex = '';
+	for (let i = 1; i < 17; i++) hex += data[i].toString(16).padStart(2, '0');
+	return normalizeMembershipUuid(`${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`);
 }
 
 function 解析魏烈思请求(chunk, token) {

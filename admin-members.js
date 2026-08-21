@@ -31,7 +31,17 @@ export function renderAdminMembersPage() {
 		.stat-label { color:#617087; font-size:.82rem } .stat-value { margin-top:.25rem; font-size:1.45rem; font-weight:750 }
 		.toolbar { display:grid; grid-template-columns:minmax(220px,1fr) minmax(150px,230px); gap:.8rem; align-items:end }
 		.field { display:grid; gap:.35rem } .field label { color:#43516a; font-size:.9rem; font-weight:650 }
-		.field input,.field select { width:100%; min-height:44px; border:1px solid #cbd5e3; border-radius:10px; background:#fff; color:#172033; padding:.65rem .75rem }
+		.field input,.field select,.field textarea { width:100%; min-height:44px; border:1px solid #cbd5e3; border-radius:10px; background:#fff; color:#172033; padding:.65rem .75rem }
+		.field textarea { min-height:88px; resize:vertical } .create-grid { display:grid; grid-template-columns:minmax(180px,1fr) minmax(220px,1.6fr) minmax(130px,.55fr); gap:.8rem; align-items:start }
+		.quick-days,.form-actions,.secret-actions,.customer-actions { display:flex; flex-wrap:wrap; gap:.55rem; align-items:center }
+		.quick-days { margin-top:.8rem } .form-actions { margin-top:1rem } button.small { min-height:44px; padding:.55rem .7rem; font-size:.82rem }
+		button.danger { background:#a3212b } button.danger:hover { background:#821821 }
+		.secret-panel { border-color:#e1bd55; background:#fffaf0 } .secret-warning { color:#7a5000; font-weight:750 }
+		.secret-grid { display:grid; grid-template-columns:minmax(130px,.35fr) minmax(0,1fr); gap:.55rem .9rem; margin:1rem 0 }
+		.secret-label { color:#59677c; font-weight:700 } .secret-value { overflow-wrap:anywhere; word-break:break-word; white-space:pre-wrap; font-family:ui-monospace,SFMono-Regular,Consolas,monospace }
+		.clipboard-fallback { position:fixed; left:-9999px; opacity:0 }
+		.edit-panel { border-color:#a9c4ee } .edit-heading { display:flex; justify-content:space-between; gap:1rem; align-items:flex-start }
+		.edit-heading h2 { margin-top:0 } .edit-customer-id { overflow-wrap:anywhere; color:#59677c }
 		.migration { margin-top:.85rem; color:#704d00; background:#fff8df; border:1px solid #eed68c; border-radius:10px; padding:.75rem }
 		.table-wrap { overflow-x:auto } table { width:100%; border-collapse:collapse; min-width:1150px }
 		th,td { padding:.75rem .6rem; border-bottom:1px solid #e5eaf1; text-align:left; vertical-align:top } th { color:#536176; background:#f8fafc; font-size:.82rem; white-space:nowrap } td { font-size:.9rem }
@@ -43,6 +53,7 @@ export function renderAdminMembersPage() {
 		@media (max-width:980px) { .stats { grid-template-columns:repeat(3,minmax(0,1fr)) } }
 		@media (max-width:760px) {
 			.page { padding:.8rem } .topbar { align-items:flex-start; flex-direction:column } .topbar-actions { width:100% } .topbar-actions>* { flex:1 1 130px }
+			.create-grid,.secret-grid { grid-template-columns:1fr } .secret-label { margin-top:.35rem } .customer-actions { align-items:stretch } .customer-actions button { flex:1 1 115px }
 			.stats { grid-template-columns:repeat(2,minmax(0,1fr)) } .toolbar { grid-template-columns:1fr } .table-wrap { overflow:visible }
 			table,tbody,tr,td { display:block; min-width:0; width:100% } thead { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap }
 			tbody { display:grid; gap:.8rem } tr { border:1px solid #dce3ee; border-radius:12px; padding:.45rem .75rem; background:#fff }
@@ -57,11 +68,47 @@ export function renderAdminMembersPage() {
 		<header class="topbar">
 			<h1>会员管理</h1>
 			<div class="topbar-actions">
-				<a class="button-link secondary" href="/admin">返回原后台</a>
+				<a id="admin-link" class="button-link secondary" href="/admin">返回原后台</a>
 				<button id="refresh-button" type="button">刷新列表</button>
 			</div>
 		</header>
 		<div id="message" class="message" role="status" aria-live="polite" hidden></div>
+		<section class="panel" aria-labelledby="create-title">
+			<h2 id="create-title">创建客户</h2>
+			<form id="create-form" novalidate>
+				<div class="create-grid">
+					<div class="field"><label for="create-name">客户名称</label><input id="create-name" type="text" maxlength="80" autocomplete="off" required></div>
+					<div class="field"><label for="create-remark">备注</label><textarea id="create-remark" maxlength="500" autocomplete="off"></textarea></div>
+					<div class="field"><label for="create-duration">套餐天数</label><input id="create-duration" type="number" min="1" max="3650" step="1" inputmode="numeric" value="30" required></div>
+				</div>
+				<div class="quick-days" aria-label="快捷套餐天数">
+					<button class="secondary quick-day" type="button" data-days="30">30天</button><button class="secondary quick-day" type="button" data-days="90">90天</button><button class="secondary quick-day" type="button" data-days="180">180天</button><button class="secondary quick-day" type="button" data-days="365">365天</button>
+				</div>
+				<div class="form-actions"><button id="create-button" type="submit">创建客户</button></div>
+			</form>
+		</section>
+		<section id="secret-panel" class="panel secret-panel" aria-labelledby="secret-title" hidden>
+			<h2 id="secret-title">一次性订阅凭据</h2>
+			<p class="secret-warning">订阅Token和完整链接只显示一次，请立即保存。</p>
+			<div class="secret-grid">
+				<div class="secret-label">customerId</div><div id="secret-customer-id" class="secret-value"></div>
+				<div class="secret-label">UUID</div><div id="secret-uuid" class="secret-value"></div>
+				<div class="secret-label">到期时间</div><div id="secret-expires-at" class="secret-value"></div>
+				<div class="secret-label">Token</div><div id="secret-token" class="secret-value"></div>
+				<div class="secret-label">订阅链接</div><div id="secret-subscription-url" class="secret-value"></div>
+			</div>
+			<div class="secret-actions"><button id="copy-subscription" type="button">复制订阅链接</button><button id="copy-secret-uuid" class="secondary" type="button">复制UUID</button><button id="copy-token" class="secondary" type="button">复制Token</button><button id="clear-secret" class="danger" type="button">清除凭据</button></div>
+		</section>
+		<section id="edit-panel" class="panel edit-panel" aria-labelledby="edit-title" hidden>
+			<div class="edit-heading"><div><h2 id="edit-title">编辑客户资料</h2><div id="edit-customer-id" class="edit-customer-id"></div></div></div>
+			<form id="edit-form" novalidate>
+				<div class="create-grid">
+					<div class="field"><label for="edit-name">客户名称</label><input id="edit-name" type="text" maxlength="80" autocomplete="off" required></div>
+					<div class="field"><label for="edit-remark">备注</label><textarea id="edit-remark" maxlength="500" autocomplete="off"></textarea></div>
+				</div>
+				<div class="form-actions"><button id="save-edit" type="submit">保存修改</button><button id="cancel-edit" class="secondary" type="button">取消</button></div>
+			</form>
+		</section>
 		<section class="panel" aria-labelledby="stats-title">
 			<h2 id="stats-title">当前页面</h2>
 			<p class="notice">当前统计仅基于已加载客户</p>
@@ -105,8 +152,12 @@ export function renderAdminMembersPage() {
 		const customersById = new Map();
 		const customerOrder = [];
 		const requestedCursors = new Set();
+		const customerOperations = new Map();
 		let nextCursor = null;
 		let listBusy = false;
+		let createBusy = false;
+		let editingCustomerId = null;
+		let oneTimeSecret = null;
 		let requestGeneration = 0;
 		let activeController = null;
 		let currentPageMigrationRequired = 0;
@@ -114,6 +165,9 @@ export function renderAdminMembersPage() {
 			message: document.getElementById('message'), refresh: document.getElementById('refresh-button'), loadMore: document.getElementById('load-more-button'),
 			search: document.getElementById('search-input'), filter: document.getElementById('status-filter'), list: document.getElementById('customer-list'),
 			tableWrap: document.getElementById('table-wrap'), migration: document.getElementById('migration-notice'),
+			adminLink: document.getElementById('admin-link'), createForm: document.getElementById('create-form'), createName: document.getElementById('create-name'), createRemark: document.getElementById('create-remark'), createDuration: document.getElementById('create-duration'), createButton: document.getElementById('create-button'), quickDays: Array.from(document.querySelectorAll('.quick-day')),
+			secretPanel: document.getElementById('secret-panel'), secretCustomerId: document.getElementById('secret-customer-id'), secretUuid: document.getElementById('secret-uuid'), secretExpiresAt: document.getElementById('secret-expires-at'), secretToken: document.getElementById('secret-token'), secretSubscriptionUrl: document.getElementById('secret-subscription-url'), copySubscription: document.getElementById('copy-subscription'), copySecretUuid: document.getElementById('copy-secret-uuid'), copyToken: document.getElementById('copy-token'), clearSecret: document.getElementById('clear-secret'),
+			editPanel: document.getElementById('edit-panel'), editForm: document.getElementById('edit-form'), editCustomerId: document.getElementById('edit-customer-id'), editName: document.getElementById('edit-name'), editRemark: document.getElementById('edit-remark'), saveEdit: document.getElementById('save-edit'), cancelEdit: document.getElementById('cancel-edit'),
 			counts: { loaded: document.getElementById('count-loaded'), normal: document.getElementById('count-normal'), disabled: document.getElementById('count-disabled'), expired: document.getElementById('count-expired'), pending: document.getElementById('count-pending') }
 		};
 
@@ -146,6 +200,108 @@ export function renderAdminMembersPage() {
 			if (!Number.isSafeInteger(value.migrationRequired) || value.migrationRequired < 0) throw new Error('invalid_response');
 			return { items: value.items.map(validateCustomer), cursor: value.cursor, migrationRequired: value.migrationRequired };
 		}
+		function validateCustomerEnvelope(value) {
+			if (!hasExactFields(value, ['customer'])) throw new Error('invalid_response');
+			return { customer: validateCustomer(value.customer) };
+		}
+		function validateCreatePayload(value) {
+			if (!hasExactFields(value, ['customer','rawToken','subscriptionUrl','secretReturnedOnce']) || value.secretReturnedOnce !== true) throw new Error('invalid_response');
+			if (typeof value.rawToken !== 'string' || !/^[A-Za-z0-9_-]{43,512}$/.test(value.rawToken) || typeof value.subscriptionUrl !== 'string' || value.subscriptionUrl.length > 4096) throw new Error('invalid_response');
+			let subscriptionUrl;
+			try { subscriptionUrl = new URL(value.subscriptionUrl); } catch (_) { throw new Error('invalid_response'); }
+			if (subscriptionUrl.origin !== location.origin || subscriptionUrl.pathname !== '/sub' || subscriptionUrl.username || subscriptionUrl.password || subscriptionUrl.hash || subscriptionUrl.searchParams.getAll('token').length !== 1 || subscriptionUrl.searchParams.get('token') !== value.rawToken) throw new Error('invalid_response');
+			return { customer: validateCustomer(value.customer), rawToken: value.rawToken, subscriptionUrl: subscriptionUrl.toString(), secretReturnedOnce: true };
+		}
+		function upsertCustomer(customer) {
+			if (!customersById.has(customer.customerId)) customerOrder.push(customer.customerId);
+			customersById.set(customer.customerId, customer);
+			renderAll();
+		}
+		function clearOneTimeSecret() {
+			if (oneTimeSecret) { oneTimeSecret.rawToken = ''; oneTimeSecret.subscriptionUrl = ''; oneTimeSecret.uuid = ''; }
+			oneTimeSecret = null;
+			[elements.secretCustomerId,elements.secretUuid,elements.secretExpiresAt,elements.secretToken,elements.secretSubscriptionUrl].forEach((element) => { element.textContent = ''; });
+			elements.secretPanel.hidden = true;
+		}
+		function showOneTimeSecret(payload) {
+			clearOneTimeSecret();
+			oneTimeSecret = { customerId: payload.customer.customerId, uuid: payload.customer.uuid, expiresAt: payload.customer.expiresAt, rawToken: payload.rawToken, subscriptionUrl: payload.subscriptionUrl };
+			elements.secretCustomerId.textContent = oneTimeSecret.customerId;
+			elements.secretUuid.textContent = oneTimeSecret.uuid;
+			elements.secretExpiresAt.textContent = formatLocalTime(oneTimeSecret.expiresAt);
+			elements.secretToken.textContent = oneTimeSecret.rawToken;
+			elements.secretSubscriptionUrl.textContent = oneTimeSecret.subscriptionUrl;
+			elements.secretPanel.hidden = false;
+		}
+		function mutationErrorMessage(status, payload) {
+			const code = isPlainObject(payload?.error) && typeof payload.error.code === 'string' ? payload.error.code : '';
+			if (status === 400) return '请求内容有误，请检查后重试';
+			if (status === 403) return '安全校验失败，请刷新页面后重试';
+			if (status === 404) return '客户不存在或已被删除';
+			if (status === 405) return '页面与服务端版本不匹配';
+			if (status === 409 && code === 'customer_pending') return '客户尚未激活';
+			if (status === 409 && code === 'migration_required') return '该记录需要迁移';
+			if (status === 409) return '客户状态冲突，请刷新列表后重试';
+			if (status === 413) return '请求内容过大';
+			if (status === 415) return '请求格式异常';
+			if (status === 500 || status === 503) return '服务暂时异常，请稍后重试';
+			return '操作失败，请稍后重试';
+		}
+		function safeMutationErrorMessage(error) {
+			const allowed = new Set(['请求内容有误，请检查后重试','安全校验失败，请刷新页面后重试','客户不存在或已被删除','页面与服务端版本不匹配','客户尚未激活','该记录需要迁移','客户状态冲突，请刷新列表后重试','请求内容过大','请求格式异常','服务暂时异常，请稍后重试','操作失败，请稍后重试','服务返回的数据格式异常，请稍后重试']);
+			return allowed.has(error?.message) ? error.message : '操作失败，请稍后重试';
+		}
+		function handleUnauthorized() {
+			clearOneTimeSecret();
+			customerOperations.clear();
+			createBusy = false;
+			closeEditPanel();
+			clearCustomerState();
+			window.location.href = '/login';
+		}
+		async function mutationRequest(path, method, body, expectedStatus, validator) {
+			const response = await fetch(path, {
+				method,
+				credentials: 'same-origin',
+				headers: { 'Content-Type':'application/json', 'X-Admin-Request':'1' },
+				body: JSON.stringify(body),
+			});
+			if (response.status === 401) { handleUnauthorized(); throw new Error('redirecting'); }
+			const contentType = response.headers.get('Content-Type') || '';
+			const isJson = contentType.toLowerCase().includes('application/json');
+			let payload = null;
+			if (isJson) {
+				try { payload = await response.json(); } catch (_) { throw new Error(mutationErrorMessage(response.status, null)); }
+			}
+			if (!response.ok) throw new Error(mutationErrorMessage(response.status, payload));
+			if (!isJson || response.status !== expectedStatus) throw new Error('服务返回的数据格式异常，请稍后重试');
+			try { return validator(payload); } catch (_) { throw new Error('服务返回的数据格式异常，请稍后重试'); }
+		}
+		async function copyTextSafely(value, successMessage) {
+			if (typeof value !== 'string' || value.length === 0) { showMessage('复制失败，请手动复制', 'error'); return; }
+			try {
+				if (!navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') throw new Error('clipboard_unavailable');
+				await navigator.clipboard.writeText(value);
+				showMessage(successMessage, 'info');
+				return;
+			} catch (_) { }
+			let textarea = null;
+			try {
+				textarea = document.createElement('textarea');
+				textarea.readOnly = true;
+				textarea.value = value;
+				textarea.setAttribute('aria-hidden', 'true');
+				textarea.className = 'clipboard-fallback';
+				document.body.appendChild(textarea);
+				textarea.select();
+				if (!document.execCommand('copy')) throw new Error('copy_failed');
+				showMessage(successMessage, 'info');
+			} catch (_) {
+				showMessage('复制失败，请手动复制', 'error');
+			} finally {
+				if (textarea) { textarea.value = ''; textarea.remove(); }
+			}
+		}
 		function clearMessage() { elements.message.hidden = true; elements.message.textContent = ''; elements.message.className = 'message'; }
 		function showMessage(text, type) { elements.message.textContent = text; elements.message.className = 'message ' + (type === 'info' ? 'info' : 'error'); elements.message.hidden = false; }
 		function statusOf(customer) {
@@ -168,6 +324,52 @@ export function renderAdminMembersPage() {
 			if (delta > 0) return '剩余 ' + Math.ceil(delta / DAY_MS) + ' 天';
 			return '已过期 ' + Math.floor(Math.abs(delta) / DAY_MS) + ' 天';
 		}
+		function validateEditableFields(nameValue, remarkValue) {
+			const name = nameValue.trim(), remark = remarkValue;
+			if (Array.from(name).length < 1 || Array.from(name).length > 80 || /[\\u0000-\\u001f\\u007f-\\u009f]/.test(name)) throw new Error('客户名称不能为空，且不能包含控制字符');
+			if (Array.from(remark).length > 500 || /[\\u0000-\\u001f\\u007f-\\u009f]/.test(remark)) throw new Error('备注不能超过500个字符或包含控制字符');
+			return { name, remark };
+		}
+		function validateDurationDays(value) {
+			const text = String(value).trim();
+			if (!/^\\d+$/.test(text)) throw new Error('套餐天数必须是正整数');
+			const durationDays = Number(text);
+			if (!Number.isInteger(durationDays) || durationDays < 1 || durationDays > 3650) throw new Error('套餐天数必须是1到3650之间的整数');
+			return durationDays;
+		}
+		function setCreateBusy(busy) {
+			createBusy = busy;
+			elements.createButton.disabled = busy;
+			elements.createName.disabled = busy;
+			elements.createRemark.disabled = busy;
+			elements.createDuration.disabled = busy;
+			elements.quickDays.forEach((button) => { button.disabled = busy; });
+			elements.refresh.disabled = listBusy || createBusy || customerOperations.size > 0;
+		}
+		function closeEditPanel() {
+			editingCustomerId = null;
+			elements.editCustomerId.textContent = '';
+			elements.editName.value = '';
+			elements.editRemark.value = '';
+			elements.editPanel.hidden = true;
+		}
+		function openEditPanel(customerId) {
+			const customer = customersById.get(customerId);
+			if (!customer || customerOperations.has(customerId)) return;
+			editingCustomerId = customerId;
+			elements.editCustomerId.textContent = customer.customerId;
+			elements.editName.value = customer.name;
+			elements.editRemark.value = customer.remark;
+			elements.editPanel.hidden = false;
+			elements.editName.focus();
+		}
+		function updateEditControls() {
+			const busy = editingCustomerId !== null && customerOperations.has(editingCustomerId);
+			elements.saveEdit.disabled = busy;
+			elements.cancelEdit.disabled = busy;
+			elements.editName.disabled = busy;
+			elements.editRemark.disabled = busy;
+		}
 		function createTextCell(label, value, className) {
 			const cell = document.createElement('td');
 			cell.setAttribute('data-label', label);
@@ -189,6 +391,32 @@ export function renderAdminMembersPage() {
 				note.textContent = customer.timeInvalid ? '时间异常' : '同时已过期';
 				cell.appendChild(note);
 			}
+			return cell;
+		}
+		function createActionButton(label, className, disabled, handler) {
+			const button = document.createElement('button');
+			button.type = 'button';
+			button.className = 'small' + (className ? ' ' + className : '');
+			button.textContent = label;
+			button.disabled = disabled;
+			button.addEventListener('click', handler);
+			return button;
+		}
+		function createActionsCell(customer) {
+			const cell = document.createElement('td');
+			cell.setAttribute('data-label', '操作');
+			const actions = document.createElement('div');
+			actions.className = 'customer-actions';
+			const busy = customerOperations.has(customer.customerId);
+			actions.appendChild(createActionButton('编辑', 'secondary', busy, () => openEditPanel(customer.customerId)));
+			if (customer.state === 'active' && !customer.timeInvalid) {
+				actions.appendChild(createActionButton('续费30天', 'secondary', busy, () => { void renewCustomer(customer.customerId, 30); }));
+				actions.appendChild(createActionButton('续费90天', 'secondary', busy, () => { void renewCustomer(customer.customerId, 90); }));
+				const targetEnabled = !customer.enabled;
+				actions.appendChild(createActionButton(targetEnabled ? '启用' : '停用', targetEnabled ? 'secondary' : 'danger', busy, () => { void toggleCustomer(customer.customerId, targetEnabled); }));
+			}
+			actions.appendChild(createActionButton('复制UUID', 'secondary', false, () => { void copyTextSafely(customer.uuid, 'UUID已复制'); }));
+			cell.appendChild(actions);
 			return cell;
 		}
 		function renderStats() {
@@ -234,7 +462,7 @@ export function renderAdminMembersPage() {
 				row.appendChild(createTextCell('剩余时间', formatRemaining(customer.expiresAt)));
 				row.appendChild(createTextCell('创建时间', formatLocalTime(customer.createdAt)));
 				row.appendChild(createTextCell('Token', customer.tokenPreview));
-				row.appendChild(createTextCell('操作', '操作功能下一步开放', 'muted'));
+				row.appendChild(createActionsCell(customer));
 				fragment.appendChild(row);
 			});
 			elements.list.replaceChildren(fragment);
@@ -246,7 +474,9 @@ export function renderAdminMembersPage() {
 		}
 		function renderAll() {
 			renderStats(); renderMigrationNotice(); renderCustomers(); updateLoadMoreButton();
-			elements.refresh.disabled = listBusy;
+			setCreateBusy(createBusy);
+			updateEditControls();
+			elements.refresh.disabled = listBusy || createBusy || customerOperations.size > 0;
 			elements.tableWrap.classList.toggle('loading', listBusy);
 		}
 		function clearCustomerState() {
@@ -272,8 +502,7 @@ export function renderAdminMembersPage() {
 		}
 		async function parseListResponse(response) {
 			if (response.status === 401) {
-				clearCustomerState();
-				window.location.href = '/login';
+				handleUnauthorized();
 				throw new Error('redirecting');
 			}
 			const contentType = response.headers.get('Content-Type') || '';
@@ -282,6 +511,96 @@ export function renderAdminMembersPage() {
 			try { payload = await response.json(); } catch (_) { throw new Error(errorMessageForStatus(response.status)); }
 			if (!response.ok) throw new Error(errorMessageForStatus(response.status));
 			try { return validateListPayload(payload); } catch (_) { throw new Error('服务返回的数据格式异常，请稍后重试'); }
+		}
+		async function createCustomer(event) {
+			event.preventDefault();
+			if (createBusy) return;
+			let fields, durationDays;
+			try {
+				fields = validateEditableFields(elements.createName.value, elements.createRemark.value);
+				durationDays = validateDurationDays(elements.createDuration.value);
+			} catch (error) {
+				showMessage(error.message, 'error');
+				return;
+			}
+			clearOneTimeSecret();
+			clearMessage();
+			setCreateBusy(true);
+			try {
+				const created = await mutationRequest('/admin/api/customers', 'POST', { name:fields.name, remark:fields.remark, durationDays }, 201, validateCreatePayload);
+				upsertCustomer(created.customer);
+				showOneTimeSecret(created);
+				elements.createForm.reset();
+				elements.createDuration.value = '30';
+				showMessage('客户创建成功，请立即保存一次性订阅凭据', 'info');
+			} catch (error) {
+				if (error.message !== 'redirecting') showMessage(safeMutationErrorMessage(error), 'error');
+			} finally {
+				setCreateBusy(false);
+				renderAll();
+			}
+		}
+		async function saveCustomerEdit(event) {
+			event.preventDefault();
+			const customerId = editingCustomerId, customer = customerId ? customersById.get(customerId) : null;
+			if (!customer || customerOperations.has(customerId)) return;
+			let fields;
+			try { fields = validateEditableFields(elements.editName.value, elements.editRemark.value); }
+			catch (error) { showMessage(error.message, 'error'); return; }
+			const body = {};
+			if (fields.name !== customer.name) body.name = fields.name;
+			if (fields.remark !== customer.remark) body.remark = fields.remark;
+			if (Object.keys(body).length === 0) { showMessage('名称和备注没有变化', 'info'); return; }
+			customerOperations.set(customerId, 'edit');
+			clearMessage();
+			renderAll();
+			try {
+				const result = await mutationRequest('/admin/api/customers/' + encodeURIComponent(customerId), 'PATCH', body, 200, validateCustomerEnvelope);
+				upsertCustomer(result.customer);
+				closeEditPanel();
+				showMessage('客户资料已更新', 'info');
+			} catch (error) {
+				if (error.message !== 'redirecting') showMessage(safeMutationErrorMessage(error), 'error');
+			} finally {
+				customerOperations.delete(customerId);
+				renderAll();
+			}
+		}
+		async function renewCustomer(customerId, durationDays) {
+			const customer = customersById.get(customerId);
+			if (!customer || customer.state !== 'active' || customer.timeInvalid || customerOperations.has(customerId)) return;
+			if (!window.confirm('确定为该客户续费' + durationDays + '天吗？')) return;
+			customerOperations.set(customerId, 'renew');
+			clearMessage();
+			renderAll();
+			try {
+				const result = await mutationRequest('/admin/api/customers/' + encodeURIComponent(customerId) + '/renew', 'POST', { durationDays }, 200, validateCustomerEnvelope);
+				upsertCustomer(result.customer);
+				showMessage('续费成功', 'info');
+			} catch (error) {
+				if (error.message !== 'redirecting') showMessage(safeMutationErrorMessage(error), 'error');
+			} finally {
+				customerOperations.delete(customerId);
+				renderAll();
+			}
+		}
+		async function toggleCustomer(customerId, enabled) {
+			const customer = customersById.get(customerId);
+			if (!customer || customer.state !== 'active' || customer.timeInvalid || customerOperations.has(customerId) || typeof enabled !== 'boolean') return;
+			if (!window.confirm(enabled ? '确定启用该客户吗？' : '确定停用该客户吗？')) return;
+			customerOperations.set(customerId, 'toggle');
+			clearMessage();
+			renderAll();
+			try {
+				const result = await mutationRequest('/admin/api/customers/' + encodeURIComponent(customerId) + '/toggle', 'POST', { enabled }, 200, validateCustomerEnvelope);
+				upsertCustomer(result.customer);
+				showMessage(enabled ? '客户已启用' : '客户已停用', 'info');
+			} catch (error) {
+				if (error.message !== 'redirecting') showMessage(safeMutationErrorMessage(error) + '，原状态已保留，必要时请刷新列表确认', 'error');
+			} finally {
+				customerOperations.delete(customerId);
+				renderAll();
+			}
 		}
 		async function loadPage(cursor, generation) {
 			if (listBusy) return;
@@ -320,10 +639,25 @@ export function renderAdminMembersPage() {
 			if (activeController) activeController.abort();
 			activeController = null;
 			listBusy = false;
+			clearOneTimeSecret();
+			customerOperations.clear();
+			setCreateBusy(false);
+			closeEditPanel();
 			clearMessage();
 			clearCustomerState();
 			void loadPage(null, requestGeneration);
 		}
+		elements.createForm.addEventListener('submit', (event) => { void createCustomer(event); });
+		elements.editForm.addEventListener('submit', (event) => { void saveCustomerEdit(event); });
+		elements.cancelEdit.addEventListener('click', closeEditPanel);
+		elements.quickDays.forEach((button) => { button.addEventListener('click', () => { if (!createBusy) elements.createDuration.value = button.dataset.days || '30'; }); });
+		elements.copySubscription.addEventListener('click', () => { void copyTextSafely(oneTimeSecret?.subscriptionUrl || '', '订阅链接已复制'); });
+		elements.copySecretUuid.addEventListener('click', () => { void copyTextSafely(oneTimeSecret?.uuid || '', 'UUID已复制'); });
+		elements.copyToken.addEventListener('click', () => { void copyTextSafely(oneTimeSecret?.rawToken || '', 'Token已复制'); });
+		elements.clearSecret.addEventListener('click', clearOneTimeSecret);
+		elements.adminLink.addEventListener('click', clearOneTimeSecret);
+		window.addEventListener('pagehide', clearOneTimeSecret);
+		window.addEventListener('pageshow', (event) => { if (event.persisted) clearOneTimeSecret(); });
 		elements.refresh.addEventListener('click', refreshCustomers);
 		elements.loadMore.addEventListener('click', () => {
 			if (typeof nextCursor === 'string' && nextCursor.length > 0 && !requestedCursors.has(nextCursor)) void loadPage(nextCursor, requestGeneration);
