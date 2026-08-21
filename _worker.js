@@ -6,7 +6,7 @@ const Pages静态页面 = 'https://edt-pages.github.io';
 const WS早期数据最大字节 = 8 * 1024, WS早期数据最大头长度 = Math.ceil(WS早期数据最大字节 * 4 / 3) + 4;
 const 上行合包目标字节 = 20 * 1024, 上行队列最大字节 = 16 * 1024 * 1024, 上行队列最大条目 = 4096;
 const 下行Grain包字节 = 32 * 1024, 下行Grain尾部阈值 = 512, 下行Grain低水位字节 = Math.max(4096, 下行Grain尾部阈值 * 12), 下行Grain最大等待轮次 = 4;
-const MEMBERSHIP_UUID_KEY_PREFIX = 'membership:uuid:', MEMBERSHIP_TOKEN_KEY_PREFIX = 'membership:token:';
+const MEMBERSHIP_CUSTOMER_KEY_PREFIX = 'membership:customer:', MEMBERSHIP_UUID_KEY_PREFIX = 'membership:uuid:', MEMBERSHIP_TOKEN_KEY_PREFIX = 'membership:token:';
 const MEMBERSHIP_MODES = new Set(['legacy', 'hybrid', 'membership']);
 let TCP并发拨号数 = 2, 反代并发拨号数 = 1, 预加载竞速拨号 = false;
 
@@ -41,18 +41,18 @@ function getMembershipAdminRoute(pathname) {
 	if (segments[0] === '') segments.shift();
 	const normalizedSegments = segments.map(segment => segment.toLowerCase());
 	const isAdminApi = normalizedSegments[0] === 'admin' && normalizedSegments[1] === 'api';
-	let route = null;
+	let route = null, customerId = null;
 	if (normalizedSegments.length === 2 && normalizedSegments[0] === 'admin' && normalizedSegments[1] === 'members') route = 'members_page';
 	else if (normalizedSegments.length === 3 && isAdminApi && normalizedSegments[2] === 'customers') route = 'customers';
-	else if (normalizedSegments.length === 5 && isAdminApi && normalizedSegments[2] === 'customers' && ['renew', 'toggle'].includes(normalizedSegments[4])) {
-		let customerId = null;
+	else if ([4, 5].includes(normalizedSegments.length) && isAdminApi && normalizedSegments[2] === 'customers') {
 		try {
 			const decodedCustomerId = decodeURIComponent(segments[3]);
 			if (/^cus_[A-Za-z0-9_-]{16,128}$/.test(decodedCustomerId)) customerId = decodedCustomerId;
 		} catch (_) { }
-		if (customerId) route = normalizedSegments[4];
+		if (customerId && normalizedSegments.length === 4) route = 'customer_detail';
+		else if (customerId && ['renew', 'toggle'].includes(normalizedSegments[4])) route = normalizedSegments[4];
 	}
-	return { isAdminApi, route };
+	return { isAdminApi, route, customerId };
 }
 
 async function hashMembershipToken(rawToken) {
@@ -67,69 +67,120 @@ function normalizeMembershipUuid(uuid) {
 	return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(normalized) ? normalized : null;
 }
 
-function parseMembershipCustomer(rawCustomer) {
-	let customer = rawCustomer;
-	if (typeof rawCustomer === 'string') {
-		try {
-			customer = JSON.parse(rawCustomer);
-		} catch (_) {
-			throw new Error('Invalid membership customer record');
-		}
+function parseMembershipRecordJson(rawRecord, errorMessage) {
+	if (typeof rawRecord !== 'string') return rawRecord;
+	try {
+		return JSON.parse(rawRecord);
+	} catch (_) {
+		throw new Error(errorMessage);
+	}
+}
+
+function parseMembershipPointer(rawPointer) {
+	const pointer = parseMembershipRecordJson(rawPointer, 'Invalid membership pointer record');
+	if (!isPlainObject(pointer)) throw new Error('Invalid membership pointer record');
+	if (pointer.schemaVersion === 2) {
+		const allowedFields = ['schemaVersion', 'customerId', 'kind'];
+		if (!hasOnlyFields(pointer, allowedFields) || Object.keys(pointer).length !== allowedFields.length
+			|| pointer.kind !== 'membership-pointer'
+			|| typeof pointer.customerId !== 'string' || !/^cus_[A-Za-z0-9_-]{16,128}$/.test(pointer.customerId)) throw new Error('Invalid membership pointer record');
+		return { schemaVersion: 2, customerId: pointer.customerId, kind: pointer.kind };
 	}
 
+	// schemaVersion 1 is accepted only as a compatibility pointer. Its authorization
+	// snapshot fields are validated for shape and then deliberately discarded.
+	const normalizedUuid = normalizeMembershipUuid(pointer.uuid);
+	const validLegacyPointer = pointer.schemaVersion === 1
+		&& typeof pointer.customerId === 'string' && /^cus_[A-Za-z0-9_-]{16,128}$/.test(pointer.customerId)
+		&& normalizedUuid !== null && pointer.uuid === normalizedUuid
+		&& typeof pointer.tokenHash === 'string' && /^[0-9a-f]{64}$/.test(pointer.tokenHash)
+		&& typeof pointer.enabled === 'boolean'
+		&& Number.isSafeInteger(pointer.expiresAt) && pointer.expiresAt >= 0
+		&& Number.isSafeInteger(pointer.updatedAt) && pointer.updatedAt >= 0
+		&& (pointer.revision === undefined || (Number.isSafeInteger(pointer.revision) && pointer.revision >= 1));
+	if (!validLegacyPointer) throw new Error('Invalid membership pointer record');
+	return { schemaVersion: 1, customerId: pointer.customerId, kind: 'legacy-membership-pointer' };
+}
+
+function parseMembershipCustomer(rawCustomer) {
+	const customer = parseMembershipRecordJson(rawCustomer, 'Invalid membership customer record');
+	const allowedFields = ['schemaVersion', 'customerId', 'name', 'remark', 'uuid', 'tokenHash', 'tokenPreview', 'state', 'enabled', 'expiresAt', 'createdAt', 'updatedAt', 'revision'];
 	const normalizedUuid = normalizeMembershipUuid(customer?.uuid);
-	const valid = customer && typeof customer === 'object' && !Array.isArray(customer)
-		&& customer.schemaVersion === 1
-		&& typeof customer.customerId === 'string' && customer.customerId.length > 0 && customer.customerId === customer.customerId.trim()
+	const valid = hasOnlyFields(customer, allowedFields) && Object.keys(customer).length === allowedFields.length
+		&& customer.schemaVersion === 2
+		&& typeof customer.customerId === 'string' && /^cus_[A-Za-z0-9_-]{16,128}$/.test(customer.customerId)
+		&& typeof customer.name === 'string' && customer.name === customer.name.trim()
+		&& Array.from(customer.name).length >= 1 && Array.from(customer.name).length <= 80
+		&& !/[\u0000-\u001f\u007f-\u009f]/.test(customer.name)
+		&& typeof customer.remark === 'string' && Array.from(customer.remark).length <= 500
+		&& !/[\u0000-\u001f\u007f-\u009f]/.test(customer.remark)
 		&& normalizedUuid !== null && customer.uuid === normalizedUuid
 		&& typeof customer.tokenHash === 'string' && /^[0-9a-f]{64}$/.test(customer.tokenHash)
+		&& typeof customer.tokenPreview === 'string' && /^••••[A-Za-z0-9_-]{4}$/.test(customer.tokenPreview)
+		&& ['pending', 'active'].includes(customer.state)
 		&& typeof customer.enabled === 'boolean'
 		&& Number.isSafeInteger(customer.expiresAt) && customer.expiresAt >= 0
-		&& Number.isSafeInteger(customer.updatedAt) && customer.updatedAt >= 0
+		&& Number.isSafeInteger(customer.createdAt) && customer.createdAt >= 0
+		&& Number.isSafeInteger(customer.updatedAt) && customer.updatedAt >= customer.createdAt
 		&& Number.isSafeInteger(customer.revision) && customer.revision >= 1;
 	if (!valid) throw new Error('Invalid membership customer record');
+	return { ...customer, uuid: normalizedUuid };
+}
 
-	return {
-		schemaVersion: customer.schemaVersion,
-		customerId: customer.customerId,
-		uuid: normalizedUuid,
-		tokenHash: customer.tokenHash,
-		enabled: customer.enabled,
-		expiresAt: customer.expiresAt,
-		updatedAt: customer.updatedAt,
-		revision: customer.revision,
-	};
+function createMembershipLookupError(reason) {
+	const error = new Error('Membership customer lookup failed');
+	error.code = `membership_${reason}`;
+	return error;
+}
+
+async function readMembershipRecord(env, key) {
+	if (!env?.KV || typeof env.KV.get !== 'function') throw createMembershipLookupError('kv_failed');
+	try {
+		return await env.KV.get(key);
+	} catch (_) {
+		throw createMembershipLookupError('kv_failed');
+	}
 }
 
 async function loadCustomerByToken(env, rawToken) {
 	const tokenHash = await hashMembershipToken(rawToken);
 	if (!tokenHash) return null;
-	if (!env?.KV || typeof env.KV.get !== 'function') throw new Error('Membership KV is unavailable');
-	let rawCustomer;
+	const rawPointer = await readMembershipRecord(env, MEMBERSHIP_TOKEN_KEY_PREFIX + tokenHash);
+	if (rawPointer === null || rawPointer === undefined) return null;
+	let pointer, customer;
 	try {
-		rawCustomer = await env.KV.get(MEMBERSHIP_TOKEN_KEY_PREFIX + tokenHash);
-	} catch (_) {
-		throw new Error('Membership KV lookup failed');
+		pointer = parseMembershipPointer(rawPointer);
+		const rawCustomer = await readMembershipRecord(env, MEMBERSHIP_CUSTOMER_KEY_PREFIX + pointer.customerId);
+		if (rawCustomer === null || rawCustomer === undefined) throw createMembershipLookupError('invalid_record');
+		customer = parseMembershipCustomer(rawCustomer);
+	} catch (error) {
+		if (String(error?.code || '').startsWith('membership_')) throw error;
+		throw createMembershipLookupError('invalid_record');
 	}
-	if (rawCustomer === null || rawCustomer === undefined) return null;
-	const customer = parseMembershipCustomer(rawCustomer);
-	if (customer.tokenHash !== tokenHash) throw new Error('Invalid membership customer record');
+	if (customer.customerId !== pointer.customerId || customer.tokenHash !== tokenHash) throw createMembershipLookupError('invalid_record');
+	const status = validateCustomerStatus(customer);
+	if (!status.ok) throw createMembershipLookupError(status.reason);
 	return customer;
 }
 
 async function loadCustomerByUuid(env, uuid) {
 	const normalizedUuid = normalizeMembershipUuid(uuid);
 	if (!normalizedUuid) return null;
-	if (!env?.KV || typeof env.KV.get !== 'function') throw new Error('Membership KV is unavailable');
-	let rawCustomer;
+	const rawPointer = await readMembershipRecord(env, MEMBERSHIP_UUID_KEY_PREFIX + normalizedUuid);
+	if (rawPointer === null || rawPointer === undefined) return null;
+	let pointer, customer;
 	try {
-		rawCustomer = await env.KV.get(MEMBERSHIP_UUID_KEY_PREFIX + normalizedUuid);
-	} catch (_) {
-		throw new Error('Membership KV lookup failed');
+		pointer = parseMembershipPointer(rawPointer);
+		const rawCustomer = await readMembershipRecord(env, MEMBERSHIP_CUSTOMER_KEY_PREFIX + pointer.customerId);
+		if (rawCustomer === null || rawCustomer === undefined) throw createMembershipLookupError('invalid_record');
+		customer = parseMembershipCustomer(rawCustomer);
+	} catch (error) {
+		if (String(error?.code || '').startsWith('membership_')) throw error;
+		throw createMembershipLookupError('invalid_record');
 	}
-	if (rawCustomer === null || rawCustomer === undefined) return null;
-	const customer = parseMembershipCustomer(rawCustomer);
-	if (customer.uuid !== normalizedUuid) throw new Error('Invalid membership customer record');
+	if (customer.customerId !== pointer.customerId || customer.uuid !== normalizedUuid) throw createMembershipLookupError('invalid_record');
+	const status = validateCustomerStatus(customer);
+	if (!status.ok) throw createMembershipLookupError(status.reason);
 	return customer;
 }
 
@@ -141,9 +192,387 @@ function validateCustomerStatus(customer, now = Date.now()) {
 		return { ok: false, reason: 'invalid_record' };
 	}
 	if (!Number.isSafeInteger(now) || now < 0) return { ok: false, reason: 'invalid_time' };
+	if (parsedCustomer.state !== 'active') return { ok: false, reason: 'pending' };
 	if (parsedCustomer.enabled !== true) return { ok: false, reason: 'disabled' };
 	if (now >= parsedCustomer.expiresAt) return { ok: false, reason: 'expired' };
 	return { ok: true, reason: null };
+}
+
+function createAdminCustomerError(code) {
+	const error = new Error('Admin customer operation failed');
+	error.code = code;
+	return error;
+}
+
+function isPlainObject(value) {
+	return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function hasOnlyFields(value, allowedFields) {
+	return isPlainObject(value) && Object.keys(value).every(key => allowedFields.includes(key));
+}
+
+function normalizeAdminCustomerName(value) {
+	if (typeof value !== 'string') throw createAdminCustomerError('invalid_input');
+	const normalized = value.trim();
+	if (Array.from(normalized).length < 1 || Array.from(normalized).length > 80 || /[\u0000-\u001f\u007f-\u009f]/.test(normalized)) throw createAdminCustomerError('invalid_input');
+	return normalized;
+}
+
+function normalizeAdminCustomerRemark(value) {
+	if (typeof value !== 'string' || Array.from(value).length > 500 || /[\u0000-\u001f\u007f-\u009f]/.test(value)) throw createAdminCustomerError('invalid_input');
+	return value;
+}
+
+function validateAdminDurationDays(value) {
+	if (!Number.isInteger(value) || value < 1 || value > 3650) throw createAdminCustomerError('invalid_input');
+	return value;
+}
+
+async function parseAdminJsonBody(request, maxBytes = 8 * 1024) {
+	const contentType = (request.headers.get('Content-Type') || '').split(';', 1)[0].trim().toLowerCase();
+	if (contentType !== 'application/json') return { ok: false, response: createAdminApiResponse({ error: { code: 'unsupported_media_type', message: 'Content-Type must be application/json' } }, 415) };
+	const contentLength = request.headers.get('Content-Length');
+	if (contentLength !== null && /^\d+$/.test(contentLength.trim()) && Number(contentLength) > maxBytes) return { ok: false, response: createAdminApiResponse({ error: { code: 'payload_too_large', message: 'Request body is too large' } }, 413) };
+	if (!request.body) return { ok: false, response: createAdminApiResponse({ error: { code: 'invalid_json', message: 'Invalid JSON request body' } }, 400) };
+	let reader, totalBytes = 0;
+	const chunks = [];
+	try {
+		reader = request.body.getReader();
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+			if (chunk.byteLength > maxBytes - totalBytes) {
+				try { await reader.cancel(); } catch (_) { }
+				return { ok: false, response: createAdminApiResponse({ error: { code: 'payload_too_large', message: 'Request body is too large' } }, 413) };
+			}
+			totalBytes += chunk.byteLength;
+			chunks.push(chunk);
+		}
+	} catch (_) {
+		return { ok: false, response: createAdminApiResponse({ error: { code: 'invalid_json', message: 'Invalid JSON request body' } }, 400) };
+	} finally {
+		try { reader?.releaseLock(); } catch (_) { }
+	}
+	try {
+		const bodyBytes = new Uint8Array(totalBytes);
+		let offset = 0;
+		for (const chunk of chunks) {
+			bodyBytes.set(chunk, offset);
+			offset += chunk.byteLength;
+		}
+		const bodyText = new TextDecoder('utf-8', { fatal: true }).decode(bodyBytes);
+		return { ok: true, value: JSON.parse(bodyText) };
+	} catch (_) {
+		return { ok: false, response: createAdminApiResponse({ error: { code: 'invalid_json', message: 'Invalid JSON request body' } }, 400) };
+	}
+}
+
+function validateAdminMutationRequest(request) {
+	let requestOrigin;
+	try {
+		requestOrigin = new URL(request.url).origin;
+	} catch (_) {
+		return createAdminApiResponse({ error: { code: 'csrf_failed', message: 'Request origin validation failed' } }, 403);
+	}
+	if (request.headers.get('Origin') !== requestOrigin || request.headers.get('X-Admin-Request') !== '1') return createAdminApiResponse({ error: { code: 'csrf_failed', message: 'Request origin validation failed' } }, 403);
+	return null;
+}
+
+function validateCustomerAdminRecord(record) {
+	try {
+		return parseMembershipCustomer(record);
+	} catch (_) {
+		throw createAdminCustomerError('invalid_record');
+	}
+}
+
+function randomMembershipBase64Url(byteLength) {
+	const bytes = new Uint8Array(byteLength);
+	crypto.getRandomValues(bytes);
+	return btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function generateCustomerId() {
+	return 'cus_' + randomMembershipBase64Url(18);
+}
+
+function generateMembershipToken() {
+	return randomMembershipBase64Url(32);
+}
+
+function buildMembershipPointer(customerId) {
+	if (typeof customerId !== 'string' || !/^cus_[A-Za-z0-9_-]{16,128}$/.test(customerId)) throw createAdminCustomerError('invalid_record');
+	return { schemaVersion: 2, customerId, kind: 'membership-pointer' };
+}
+
+function toCustomerDetail(customer) {
+	const parsed = validateCustomerAdminRecord(customer);
+	return {
+		customerId: parsed.customerId,
+		name: parsed.name,
+		remark: parsed.remark,
+		uuid: parsed.uuid,
+		state: parsed.state,
+		enabled: parsed.enabled,
+		expiresAt: parsed.expiresAt,
+		createdAt: parsed.createdAt,
+		updatedAt: parsed.updatedAt,
+		tokenPreview: parsed.tokenPreview,
+	};
+}
+
+function toCustomerSummary(customer, now = Date.now()) {
+	const detail = toCustomerDetail(customer);
+	return { ...detail, expired: now >= detail.expiresAt };
+}
+
+async function loadCustomerById(env, customerId) {
+	if (!/^cus_[A-Za-z0-9_-]{16,128}$/.test(customerId) || !env?.KV || typeof env.KV.get !== 'function') throw createAdminCustomerError('kv_unavailable');
+	let rawCustomer;
+	try {
+		rawCustomer = await env.KV.get(MEMBERSHIP_CUSTOMER_KEY_PREFIX + customerId);
+	} catch (_) {
+		throw createAdminCustomerError('kv_failed');
+	}
+	if (rawCustomer === null || rawCustomer === undefined) return null;
+	try {
+		const decodedCustomer = parseMembershipRecordJson(rawCustomer, 'Invalid membership customer record');
+		if (decodedCustomer?.schemaVersion === 1) {
+			let legacyPointer;
+			try { legacyPointer = parseMembershipPointer(decodedCustomer); } catch (_) { throw createAdminCustomerError('invalid_record'); }
+			if (legacyPointer.schemaVersion !== 1 || legacyPointer.customerId !== customerId) throw createAdminCustomerError('invalid_record');
+			throw createAdminCustomerError('migration_required');
+		}
+		const customer = validateCustomerAdminRecord(decodedCustomer);
+		if (customer.customerId !== customerId) throw createAdminCustomerError('invalid_record');
+		return customer;
+	} catch (error) {
+		if (error?.code === 'migration_required') throw error;
+		throw createAdminCustomerError('invalid_record');
+	}
+}
+
+async function putCustomerMainRecord(env, customer) {
+	if (!env?.KV || typeof env.KV.put !== 'function') throw createAdminCustomerError('kv_unavailable');
+	const parsed = validateCustomerAdminRecord(customer);
+	try {
+		await env.KV.put(MEMBERSHIP_CUSTOMER_KEY_PREFIX + parsed.customerId, JSON.stringify(parsed));
+	} catch (_) {
+		throw createAdminCustomerError('kv_failed');
+	}
+	return parsed;
+}
+
+async function putMembershipPointer(env, key, customerId) {
+	if (!env?.KV || typeof env.KV.put !== 'function') throw createAdminCustomerError('kv_unavailable');
+	try {
+		await env.KV.put(key, JSON.stringify(buildMembershipPointer(customerId)));
+	} catch (_) {
+		throw createAdminCustomerError('kv_failed');
+	}
+}
+
+async function cleanupCustomerCreationPointers(env, entries, written) {
+	if (!env?.KV || typeof env.KV.delete !== 'function') return;
+	for (const type of ['token', 'uuid']) {
+		if (!written.has(type)) continue;
+		try { await env.KV.delete(entries[type]); } catch (_) { }
+	}
+}
+
+async function mapWithConcurrency(items, concurrency, mapper) {
+	const results = new Array(items.length);
+	let nextIndex = 0;
+	async function worker() {
+		while (nextIndex < items.length) {
+			const index = nextIndex++;
+			results[index] = await mapper(items[index], index);
+		}
+	}
+	await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, () => worker()));
+	return results;
+}
+
+function nextCustomerUpdatedAt(customer) {
+	const updatedAt = Math.max(Date.now(), customer.updatedAt + 1);
+	if (!Number.isSafeInteger(updatedAt)) throw createAdminCustomerError('invalid_record');
+	return updatedAt;
+}
+
+function nextCustomerRevision(customer) {
+	const revision = customer.revision + 1;
+	if (!Number.isSafeInteger(revision) || revision < 2) throw createAdminCustomerError('invalid_record');
+	return revision;
+}
+
+function validateAdminBodyFields(body, allowedFields, requiredFields = []) {
+	if (!hasOnlyFields(body, allowedFields) || !requiredFields.every(field => Object.prototype.hasOwnProperty.call(body, field))) throw createAdminCustomerError('invalid_input');
+	return body;
+}
+
+async function handleAdminCustomerApi(request, env, route, legacyContext) {
+	const method = request.method.toUpperCase();
+	const allowed = route.route === 'customers' ? ['GET', 'POST'] : route.route === 'customer_detail' ? ['PATCH'] : ['POST'];
+	if (!allowed.includes(method)) return createAdminApiResponse({ error: { code: 'method_not_allowed', message: 'Method not allowed' } }, 405);
+
+	let body = null;
+	if (method !== 'GET') {
+		const csrfResponse = validateAdminMutationRequest(request);
+		if (csrfResponse) return csrfResponse;
+		const parsedBody = await parseAdminJsonBody(request);
+		if (!parsedBody.ok) return parsedBody.response;
+		body = parsedBody.value;
+	}
+	const requiredKvMethods = route.route === 'customers' && method === 'GET' ? ['get', 'list'] : route.route === 'customers' ? ['get', 'put', 'delete'] : ['get', 'put'];
+	if (!env?.KV || requiredKvMethods.some(kvMethod => typeof env.KV[kvMethod] !== 'function')) return createAdminApiResponse({ error: { code: 'service_unavailable', message: 'Membership customer service is temporarily unavailable' } }, 503);
+
+	try {
+		if (route.route === 'customers' && method === 'GET') {
+			if (!env?.KV || typeof env.KV.list !== 'function' || typeof env.KV.get !== 'function') throw createAdminCustomerError('kv_unavailable');
+			const requestUrl = new URL(request.url), limitValues = requestUrl.searchParams.getAll('limit'), cursorValues = requestUrl.searchParams.getAll('cursor');
+			if (limitValues.length > 1 || cursorValues.length > 1) throw createAdminCustomerError('invalid_input');
+			const limitText = limitValues[0], limit = limitText === undefined ? 50 : (/^\d+$/.test(limitText) ? Number(limitText) : NaN);
+			if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw createAdminCustomerError('invalid_input');
+			const listOptions = { prefix: MEMBERSHIP_CUSTOMER_KEY_PREFIX, limit };
+			if (cursorValues[0]) listOptions.cursor = cursorValues[0];
+			let page;
+			try {
+				page = await env.KV.list(listOptions);
+			} catch (_) {
+				throw createAdminCustomerError('kv_failed');
+			}
+			if (!page || !Array.isArray(page.keys)) throw createAdminCustomerError('kv_failed');
+			const now = Date.now();
+			const results = await mapWithConcurrency(page.keys, 10, async key => {
+				if (!key || typeof key.name !== 'string' || !key.name.startsWith(MEMBERSHIP_CUSTOMER_KEY_PREFIX)) return { item: null, issue: 'invalid' };
+				const customerId = key.name.slice(MEMBERSHIP_CUSTOMER_KEY_PREFIX.length);
+				if (!/^cus_[A-Za-z0-9_-]{16,128}$/.test(customerId)) return { item: null, issue: 'invalid' };
+				try {
+					const customer = await loadCustomerById(env, customerId);
+					return { item: customer ? toCustomerSummary(customer, now) : null, issue: null };
+				} catch (error) {
+					if (error?.code === 'migration_required') return { item: null, issue: 'migration_required' };
+					if (error?.code === 'invalid_record') return { item: null, issue: 'invalid' };
+					throw error;
+				}
+			});
+			const nextCursor = page.list_complete === true ? null : (typeof page.cursor === 'string' && page.cursor ? page.cursor : null);
+			if (page.list_complete !== true && nextCursor === null) throw createAdminCustomerError('kv_failed');
+			const migrationRequired = results.filter(result => result.issue === 'migration_required').length;
+			const invalidRecords = results.filter(result => result.issue === 'invalid').length;
+			if (migrationRequired > 0) console.warn(`Skipped legacy membership customer records requiring migration: ${migrationRequired}`);
+			if (invalidRecords > 0) console.warn(`Skipped invalid membership customer records: ${invalidRecords}`);
+			return createAdminApiResponse({ items: results.map(result => result.item).filter(Boolean), cursor: nextCursor, migrationRequired }, 200);
+		}
+
+		if (route.route === 'customers' && method === 'POST') {
+			validateAdminBodyFields(body, ['name', 'remark', 'durationDays'], ['name', 'durationDays']);
+			const name = normalizeAdminCustomerName(body.name), remark = body.remark === undefined ? '' : normalizeAdminCustomerRemark(body.remark), durationDays = validateAdminDurationDays(body.durationDays);
+			if (!env?.KV || typeof env.KV.get !== 'function' || typeof env.KV.put !== 'function' || typeof env.KV.delete !== 'function') throw createAdminCustomerError('kv_unavailable');
+			const legacyUuid = String(legacyContext.userID || '').toLowerCase(), legacyToken = await MD5MD5(legacyContext.host + legacyContext.userID);
+			let candidate = null;
+			for (let attempt = 0; attempt < 5 && !candidate; attempt++) {
+				const customerId = generateCustomerId(), uuid = crypto.randomUUID().toLowerCase(), rawToken = generateMembershipToken(), tokenHash = await hashMembershipToken(rawToken);
+				if (!tokenHash || uuid === legacyUuid || rawToken === legacyToken) continue;
+				let existing;
+				try {
+					existing = await Promise.all([
+						env.KV.get(MEMBERSHIP_CUSTOMER_KEY_PREFIX + customerId),
+						env.KV.get(MEMBERSHIP_UUID_KEY_PREFIX + uuid),
+						env.KV.get(MEMBERSHIP_TOKEN_KEY_PREFIX + tokenHash),
+					]);
+				} catch (_) {
+					throw createAdminCustomerError('kv_failed');
+				}
+				if (existing.every(value => value === null || value === undefined)) candidate = { customerId, uuid, rawToken, tokenHash };
+			}
+			if (!candidate) throw createAdminCustomerError('kv_failed');
+			const now = Date.now(), expiresAt = now + durationDays * 86400000;
+			if (!Number.isSafeInteger(expiresAt)) throw createAdminCustomerError('invalid_record');
+			const customer = validateCustomerAdminRecord({
+				schemaVersion: 2,
+				customerId: candidate.customerId,
+				name,
+				remark,
+				uuid: candidate.uuid,
+				tokenHash: candidate.tokenHash,
+				tokenPreview: '••••' + candidate.rawToken.slice(-4),
+				state: 'active',
+				enabled: true,
+				expiresAt,
+				createdAt: now,
+				updatedAt: now,
+				revision: 1,
+			});
+			const entries = {
+				uuid: MEMBERSHIP_UUID_KEY_PREFIX + candidate.uuid,
+				token: MEMBERSHIP_TOKEN_KEY_PREFIX + candidate.tokenHash,
+			};
+			const written = new Set();
+			try {
+				await putMembershipPointer(env, entries.uuid, candidate.customerId);
+				written.add('uuid');
+				await putMembershipPointer(env, entries.token, candidate.customerId);
+				written.add('token');
+				await putCustomerMainRecord(env, customer);
+			} catch (_) {
+				await cleanupCustomerCreationPointers(env, entries, written);
+				throw createAdminCustomerError('kv_failed');
+			}
+			const subscriptionUrl = new URL('/sub', request.url);
+			subscriptionUrl.searchParams.set('token', candidate.rawToken);
+			return createAdminApiResponse({ customer: toCustomerDetail(customer), rawToken: candidate.rawToken, subscriptionUrl: subscriptionUrl.toString(), secretReturnedOnce: true }, 201);
+		}
+
+		if (route.route === 'customer_detail') {
+			validateAdminBodyFields(body, ['name', 'remark']);
+			if (!Object.prototype.hasOwnProperty.call(body, 'name') && !Object.prototype.hasOwnProperty.call(body, 'remark')) throw createAdminCustomerError('invalid_input');
+			const customer = await loadCustomerById(env, route.customerId);
+			if (!customer) return createAdminApiResponse({ error: { code: 'not_found', message: 'Customer not found' } }, 404);
+			const updated = validateCustomerAdminRecord({
+				...customer,
+				...(Object.prototype.hasOwnProperty.call(body, 'name') ? { name: normalizeAdminCustomerName(body.name) } : {}),
+				...(Object.prototype.hasOwnProperty.call(body, 'remark') ? { remark: normalizeAdminCustomerRemark(body.remark) } : {}),
+				updatedAt: nextCustomerUpdatedAt(customer),
+				revision: nextCustomerRevision(customer),
+			});
+			await putCustomerMainRecord(env, updated);
+			return createAdminApiResponse({ customer: toCustomerDetail(updated) }, 200);
+		}
+
+		if (route.route === 'renew') {
+			validateAdminBodyFields(body, ['durationDays'], ['durationDays']);
+			const durationDays = validateAdminDurationDays(body.durationDays), customer = await loadCustomerById(env, route.customerId);
+			if (!customer) return createAdminApiResponse({ error: { code: 'not_found', message: 'Customer not found' } }, 404);
+			if (customer.state !== 'active') throw createAdminCustomerError('pending_customer');
+			const now = Date.now(), expiresAt = (customer.expiresAt > now ? customer.expiresAt : now) + durationDays * 86400000;
+			if (!Number.isSafeInteger(expiresAt)) throw createAdminCustomerError('invalid_record');
+			const updated = validateCustomerAdminRecord({ ...customer, expiresAt, updatedAt: nextCustomerUpdatedAt(customer), revision: nextCustomerRevision(customer) });
+			await putCustomerMainRecord(env, updated);
+			return createAdminApiResponse({ customer: toCustomerDetail(updated) }, 200);
+		}
+
+		if (route.route === 'toggle') {
+			validateAdminBodyFields(body, ['enabled'], ['enabled']);
+			if (typeof body.enabled !== 'boolean') throw createAdminCustomerError('invalid_input');
+			const customer = await loadCustomerById(env, route.customerId);
+			if (!customer) return createAdminApiResponse({ error: { code: 'not_found', message: 'Customer not found' } }, 404);
+			if (customer.state !== 'active') throw createAdminCustomerError('pending_customer');
+			if (customer.enabled === body.enabled) return createAdminApiResponse({ customer: toCustomerDetail(customer) }, 200);
+			const updated = validateCustomerAdminRecord({ ...customer, enabled: body.enabled, updatedAt: nextCustomerUpdatedAt(customer), revision: nextCustomerRevision(customer) });
+			await putCustomerMainRecord(env, updated);
+			return createAdminApiResponse({ customer: toCustomerDetail(updated) }, 200);
+		}
+	} catch (error) {
+		if (error?.code === 'invalid_input') return createAdminApiResponse({ error: { code: 'invalid_request', message: 'Invalid request' } }, 400);
+		if (error?.code === 'pending_customer') return createAdminApiResponse({ error: { code: 'customer_pending', message: 'Customer is pending activation' } }, 409);
+		if (error?.code === 'migration_required') return createAdminApiResponse({ error: { code: 'migration_required', message: 'Customer record requires migration' } }, 409);
+		return createAdminApiResponse({ error: { code: 'service_unavailable', message: 'Membership customer service is temporarily unavailable' } }, 503);
+	}
+
+	return createAdminApiResponse({ error: { code: 'not_found', message: 'Admin API route not found' } }, 404);
 }
 
 function sanitizeSensitiveUrl(url) {
@@ -333,7 +762,7 @@ export default {
 					return new Response('重定向中...', { status: 302, headers: { 'Location': '/login' } });
 				}
 				if (会员管理路由.route === 'members_page') return createAdminApiResponse({ error: { code: 'not_implemented', message: 'Membership admin page is not implemented yet' } }, 501);
-				if (会员管理路由.route) return createAdminApiResponse({ error: { code: 'not_implemented', message: 'Membership admin API is not implemented yet' } }, 501);
+				if (会员管理路由.route) return await handleAdminCustomerApi(request, env, 会员管理路由, { host, userID });
 				if (会员管理路由.isAdminApi) return createAdminApiResponse({ error: { code: 'not_found', message: 'Admin API route not found' } }, 404);
 			}
 			if (env.KV && typeof env.KV.get === 'function') {
@@ -580,16 +1009,12 @@ export default {
 						let customer;
 						try {
 							customer = await loadCustomerByToken(env, 请求TOKEN);
-						} catch (_) {
+						} catch (error) {
+							if (error?.code === 'membership_disabled') return createSubscriptionErrorResponse(403, '订阅已停用');
+							if (error?.code === 'membership_expired') return createSubscriptionErrorResponse(410, '订阅已到期');
 							return createSubscriptionErrorResponse(503, '会员服务暂时不可用');
 						}
 						if (customer) {
-							const 客户状态 = validateCustomerStatus(customer);
-							if (!客户状态.ok) {
-								if (客户状态.reason === 'disabled') return createSubscriptionErrorResponse(403, '订阅已停用');
-								if (客户状态.reason === 'expired') return createSubscriptionErrorResponse(410, '订阅已到期');
-								return createSubscriptionErrorResponse(503, '会员服务暂时不可用');
-							}
 							订阅身份 = { kind: 'customer', uuid: customer.uuid, customer };
 							用户客户端请求订阅 = true;
 						} else if (会员模式 === 'hybrid' && 普通旧版TOKEN匹配) {
