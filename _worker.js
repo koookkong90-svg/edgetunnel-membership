@@ -1,6 +1,6 @@
 const Version = '2026-08-11 14:45:22';
 import { renderAdminMembersPage } from './admin-members.js';
-import { runMembershipUsageSettlement } from './membership-settlement.js';
+import { runMembershipUsageSettlement, getCurrentFrequencyBucketEnd } from './membership-settlement.js';
 
 let 缓存SOCKS5白名单 = null, 调试日志打印 = false;
 let SOCKS5白名单 = ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'];
@@ -399,7 +399,7 @@ function applyCustomerUsageSettlement(customer, additionalBytes, usageSettledThr
 function resetCustomerSettledUsage(customer, now = Date.now()) {
 	const parsed = parseMembershipCustomer(customer);
 	if (!Number.isSafeInteger(now) || now < 0) throw createAdminCustomerError('invalid_record');
-	return parseMembershipCustomer({ ...parsed, settledUsedBytes: 0, quotaExceeded: false, usageUpdatedAt: now });
+	return parseMembershipCustomer({ ...parsed, settledUsedBytes: 0, quotaExceeded: false, usageUpdatedAt: now, usageSettledThrough: getCurrentFrequencyBucketEnd(now) });
 }
 
 function setCustomerSettledUsage(customer, usedBytes, now = Date.now()) {
@@ -411,6 +411,7 @@ function setCustomerSettledUsage(customer, usedBytes, now = Date.now()) {
 		settledUsedBytes: usedBytes,
 		quotaExceeded: parsed.unlimitedTraffic === false && usedBytes >= parsed.quotaBytes,
 		usageUpdatedAt: now,
+		usageSettledThrough: getCurrentFrequencyBucketEnd(now),
 	});
 }
 
