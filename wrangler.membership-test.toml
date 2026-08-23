@@ -1,0 +1,32 @@
+name = "v20251104-membership-test"
+main = "_worker.js"
+compatibility_date = "2025-11-04"
+keep_vars = true
+preview_urls = false
+account_id = "6e8f02a514746ddb4a5a1bd06d14b336"
+
+[[kv_namespaces]]
+binding = "KV"
+id = "5b7451b0c7584b75bb6a820a0326102e"
+
+[vars]
+MEMBERSHIP_MODE = "hybrid"
+DEBUG = "false"
+MEMBERSHIP_USAGE_SETTLEMENT_ENABLED = "true"
+MEMBERSHIP_USAGE_ACCOUNT_ID = "6e8f02a514746ddb4a5a1bd06d14b336"
+MEMBERSHIP_USAGE_DATASET = "membership_usage_test_v1"
+MEMBERSHIP_USAGE_SETTLEMENT_TIMEZONE = "Asia/Shanghai"
+MEMBERSHIP_USAGE_SETTLEMENT_MAX_BACKFILL_DAYS = "3"
+
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+
+[[analytics_engine_datasets]]
+binding = "MEMBERSHIP_USAGE"
+dataset = "membership_usage_test_v1"
+
+[triggers]
+crons = ["30 16 * * *"]

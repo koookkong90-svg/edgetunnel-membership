@@ -1,5 +1,6 @@
-﻿const Version = '2026-08-11 14:45:22';
+const Version = '2026-08-11 14:45:22';
 import { renderAdminMembersPage } from './admin-members.js';
+import { runMembershipUsageSettlement } from './membership-settlement.js';
 
 let 缓存SOCKS5白名单 = null, 调试日志打印 = false;
 let SOCKS5白名单 = ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'];
@@ -8,8 +9,10 @@ const Pages静态页面 = 'https://edt-pages.github.io';
 const WS早期数据最大字节 = 8 * 1024, WS早期数据最大头长度 = Math.ceil(WS早期数据最大字节 * 4 / 3) + 4;
 const 上行合包目标字节 = 20 * 1024, 上行队列最大字节 = 16 * 1024 * 1024, 上行队列最大条目 = 4096;
 const 下行Grain包字节 = 32 * 1024, 下行Grain尾部阈值 = 512, 下行Grain低水位字节 = Math.max(4096, 下行Grain尾部阈值 * 12), 下行Grain最大等待轮次 = 4;
-const MEMBERSHIP_CUSTOMER_KEY_PREFIX = 'membership:customer:', MEMBERSHIP_UUID_KEY_PREFIX = 'membership:uuid:', MEMBERSHIP_TOKEN_KEY_PREFIX = 'membership:token:';
+const MEMBERSHIP_CUSTOMER_KEY_PREFIX = 'membership:customer:', MEMBERSHIP_USAGE_KEY_PREFIX = 'membership:usage:', MEMBERSHIP_UUID_KEY_PREFIX = 'membership:uuid:', MEMBERSHIP_TOKEN_KEY_PREFIX = 'membership:token:', MEMBERSHIP_CREATE_REQUEST_KEY_PREFIX = 'membership:create-request:', MEMBERSHIP_CREATE_RESULT_KEY_PREFIX = 'membership:create-result:';
 const MEMBERSHIP_MODES = new Set(['legacy', 'hybrid', 'membership']);
+const MEMBERSHIP_GIB_BYTES = 1024 ** 3, MEMBERSHIP_MAX_QUOTA_GIB = 1000000;
+const MEMBERSHIP_CREATE_REQUEST_TTL_SECONDS = 15 * 60, MEMBERSHIP_CREATE_PROCESSING_STALE_MS = 30 * 1000;
 let TCP并发拨号数 = 2, 反代并发拨号数 = 1, 预加载竞速拨号 = false;
 
 function getMembershipMode(env) {
@@ -17,6 +20,76 @@ function getMembershipMode(env) {
 	return MEMBERSHIP_MODES.has(mode) ? mode : 'legacy';
 }
 
+const MEMBERSHIP_USAGE_POLICY_VERSION = 'usage-v1';
+const MEMBERSHIP_USAGE_MAX_POINTS = 240;
+const MEMBERSHIP_USAGE_GIB = 1024 ** 3;
+
+function getMembershipUsagePolicy(env) {
+	const positiveNumber = (value, fallback, max) => {
+		const parsed = Number(value);
+		return Number.isFinite(parsed) && parsed > 0 && parsed <= max ? parsed : fallback;
+	};
+	const sampleRate = positiveNumber(env?.MEMBERSHIP_USAGE_SAMPLE_RATE, 0.1, 1);
+	return {
+		blockBytes: Math.floor(positiveNumber(env?.MEMBERSHIP_USAGE_BLOCK_GIB, 2, 1024) * MEMBERSHIP_USAGE_GIB),
+		intervalMs: Math.floor(positiveNumber(env?.MEMBERSHIP_USAGE_INTERVAL_HOURS, 4, 168) * 60 * 60 * 1000),
+		sampleRate,
+	};
+}
+
+function recordUsage(customerId, uploadBytes, downloadBytes, metadata = {}) {
+	if (typeof customerId !== 'string' || !/^cus_[A-Za-z0-9_-]{16,128}$/.test(customerId)) return Promise.resolve(false);
+	const engine = metadata?.engine;
+	if (!engine || typeof engine.writeDataPoint !== 'function') return Promise.resolve(false);
+	const upload = Number.isSafeInteger(uploadBytes) && uploadBytes >= 0 ? uploadBytes : 0;
+	const download = Number.isSafeInteger(downloadBytes) && downloadBytes >= 0 ? downloadBytes : 0;
+	if (upload === 0 && download === 0) return Promise.resolve(false);
+	const point = {
+		indexes: [customerId],
+		blobs: ['usage-v1', 'vless-ws', String(metadata.eventKind || 'connection'), MEMBERSHIP_USAGE_POLICY_VERSION],
+		doubles: [upload, download, Number.isFinite(metadata.sampleWeight) && metadata.sampleWeight > 0 ? metadata.sampleWeight : 1, 1],
+	};
+	try {
+		const result = engine.writeDataPoint(point);
+		return result && typeof result.then === 'function' ? result.then(() => true, () => false) : Promise.resolve(true);
+	} catch (_) {
+		return Promise.resolve(false);
+	}
+}
+
+function createMembershipUsageTracker(customerId, env) {
+	const engine = env?.MEMBERSHIP_USAGE;
+	const policy = getMembershipUsagePolicy(env);
+	let upload = 0, download = 0, points = 0, lastFlush = Date.now(), closed = false;
+	const flush = async (eventKind, sampleWeight = 1, force = false) => {
+		if (closed || points >= MEMBERSHIP_USAGE_MAX_POINTS) return;
+		if (!force && upload + download <= 0) return;
+		const ok = await recordUsage(customerId, upload, download, { engine, transport: 'vless-ws', eventKind, sampleWeight, policyVersion: MEMBERSHIP_USAGE_POLICY_VERSION });
+		if (ok) { upload = 0; download = 0; lastFlush = Date.now(); points++; }
+	};
+	const add = async (uploadBytes = 0, downloadBytes = 0) => {
+		if (closed) return;
+		if (Number.isSafeInteger(uploadBytes) && uploadBytes > 0) upload += uploadBytes;
+		if (Number.isSafeInteger(downloadBytes) && downloadBytes > 0) download += downloadBytes;
+		if (upload + download <= 0) return;
+		while (upload + download >= policy.blockBytes && points < MEMBERSHIP_USAGE_MAX_POINTS) {
+			const total = upload + download, ratio = policy.blockBytes / total;
+			const blockUpload = Math.min(upload, Math.floor(upload * ratio));
+			const blockDownload = policy.blockBytes - blockUpload;
+			upload -= blockUpload; download -= blockDownload;
+			await recordUsage(customerId, blockUpload, blockDownload, { engine, transport: 'vless-ws', eventKind: 'block', sampleWeight: 1, policyVersion: MEMBERSHIP_USAGE_POLICY_VERSION });
+			points++;
+		}
+		if (Date.now() - lastFlush >= policy.intervalMs) await flush('interval');
+	};
+	const close = async () => {
+		if (closed) return;
+		closed = true;
+		if (upload + download <= 0 || points >= MEMBERSHIP_USAGE_MAX_POINTS || Math.random() > policy.sampleRate) return;
+		await recordUsage(customerId, upload, download, { engine, transport: 'vless-ws', eventKind: 'close', sampleWeight: 1 / policy.sampleRate, policyVersion: MEMBERSHIP_USAGE_POLICY_VERSION });
+	};
+	return { add, close };
+}
 function getAdminAuthCookie(request) {
 	const cookies = request.headers.get('Cookie') || '';
 	const authCookie = cookies.split(';').find(cookie => cookie.trim().startsWith('auth='));
@@ -52,7 +125,7 @@ function getMembershipAdminRoute(pathname) {
 			if (/^cus_[A-Za-z0-9_-]{16,128}$/.test(decodedCustomerId)) customerId = decodedCustomerId;
 		} catch (_) { }
 		if (customerId && normalizedSegments.length === 4) route = 'customer_detail';
-		else if (customerId && ['renew', 'toggle'].includes(normalizedSegments[4])) route = normalizedSegments[4];
+		else if (customerId && ['renew', 'toggle', 'quota', 'add-quota', 'reset-usage', 'set-used-traffic', 'package'].includes(normalizedSegments[4])) route = normalizedSegments[4];
 	}
 	return { isAdminApi, route, customerId };
 }
@@ -106,10 +179,15 @@ function parseMembershipPointer(rawPointer) {
 
 function parseMembershipCustomer(rawCustomer) {
 	const customer = parseMembershipRecordJson(rawCustomer, 'Invalid membership customer record');
-	const allowedFields = ['schemaVersion', 'customerId', 'name', 'remark', 'uuid', 'tokenHash', 'tokenPreview', 'state', 'enabled', 'expiresAt', 'createdAt', 'updatedAt', 'revision'];
+	const baseFields = ['schemaVersion', 'customerId', 'name', 'remark', 'uuid', 'tokenHash', 'tokenPreview', 'state', 'enabled', 'expiresAt', 'createdAt', 'updatedAt', 'revision'];
+	const usageFields = ['quotaBytes', 'settledUsedBytes', 'quotaExceeded', 'usageUpdatedAt', 'usageSettledThrough', 'unlimitedTraffic', 'disableReason'];
+	const v3UsageFields = customer?.schemaVersion === 3 && !Object.prototype.hasOwnProperty.call(customer, 'usageSettledThrough')
+		? usageFields.filter(field => field !== 'usageSettledThrough')
+		: usageFields;
+	const allowedFields = customer?.schemaVersion === 2 ? baseFields : customer?.schemaVersion === 3 ? [...baseFields, ...v3UsageFields] : [...baseFields, ...usageFields, 'usageRevision'];
 	const normalizedUuid = normalizeMembershipUuid(customer?.uuid);
 	const valid = hasOnlyFields(customer, allowedFields) && Object.keys(customer).length === allowedFields.length
-		&& customer.schemaVersion === 2
+		&& [2, 3, 4].includes(customer.schemaVersion)
 		&& typeof customer.customerId === 'string' && /^cus_[A-Za-z0-9_-]{16,128}$/.test(customer.customerId)
 		&& typeof customer.name === 'string' && customer.name === customer.name.trim()
 		&& Array.from(customer.name).length >= 1 && Array.from(customer.name).length <= 80
@@ -126,7 +204,209 @@ function parseMembershipCustomer(rawCustomer) {
 		&& Number.isSafeInteger(customer.updatedAt) && customer.updatedAt >= customer.createdAt
 		&& Number.isSafeInteger(customer.revision) && customer.revision >= 1;
 	if (!valid) throw new Error('Invalid membership customer record');
+	if (customer.schemaVersion === 2) {
+		return {
+			...customer,
+			schemaVersion: 3,
+			uuid: normalizedUuid,
+			quotaBytes: null,
+			settledUsedBytes: 0,
+			quotaExceeded: false,
+			usageUpdatedAt: 0,
+			usageSettledThrough: 0,
+			unlimitedTraffic: true,
+			disableReason: customer.state === 'active' && customer.enabled === false ? 'manual' : null,
+		};
+	}
+	if (customer.schemaVersion === 3 && !Object.prototype.hasOwnProperty.call(customer, 'usageSettledThrough')) customer.usageSettledThrough = 0;
+	const usageValid = Number.isSafeInteger(customer.settledUsedBytes) && customer.settledUsedBytes >= 0
+		&& Number.isSafeInteger(customer.usageUpdatedAt) && customer.usageUpdatedAt >= 0
+		&& Number.isSafeInteger(customer.usageSettledThrough) && customer.usageSettledThrough >= 0
+		&& typeof customer.quotaExceeded === 'boolean'
+		&& typeof customer.unlimitedTraffic === 'boolean'
+		&& (customer.disableReason === null || customer.disableReason === 'manual')
+		&& (customer.enabled === true
+			? customer.disableReason === null
+			: customer.state === 'active' ? customer.disableReason === 'manual' : customer.disableReason === null)
+		&& (customer.unlimitedTraffic === true
+			? customer.quotaBytes === null
+			: Number.isSafeInteger(customer.quotaBytes) && customer.quotaBytes > 0)
+		&& (customer.schemaVersion !== 4 || Number.isSafeInteger(customer.usageRevision) && customer.usageRevision >= 1);
+	if (!usageValid) throw new Error('Invalid membership customer record');
 	return { ...customer, uuid: normalizedUuid };
+}
+
+function parseMembershipCustomerBase(rawBase) {
+	const base = parseMembershipRecordJson(rawBase, 'Invalid membership customer base record');
+	const fields = ['schemaVersion', 'kind', 'customerId', 'name', 'remark', 'uuid', 'tokenHash', 'tokenPreview', 'state', 'enabled', 'expiresAt', 'createdAt', 'updatedAt', 'revision', 'disableReason'];
+	const normalizedUuid = normalizeMembershipUuid(base?.uuid);
+	const valid = hasOnlyFields(base, fields) && Object.keys(base).length === fields.length
+		&& base.schemaVersion === 4 && base.kind === 'membership-customer'
+		&& typeof base.customerId === 'string' && /^cus_[A-Za-z0-9_-]{16,128}$/.test(base.customerId)
+		&& typeof base.name === 'string' && base.name === base.name.trim() && Array.from(base.name).length >= 1 && Array.from(base.name).length <= 80
+		&& !/[\u0000-\u001f\u007f-\u009f]/.test(base.name)
+		&& typeof base.remark === 'string' && Array.from(base.remark).length <= 500 && !/[\u0000-\u001f\u007f-\u009f]/.test(base.remark)
+		&& normalizedUuid !== null && base.uuid === normalizedUuid
+		&& typeof base.tokenHash === 'string' && /^[0-9a-f]{64}$/.test(base.tokenHash)
+		&& typeof base.tokenPreview === 'string' && /^••••[A-Za-z0-9_-]{4}$/.test(base.tokenPreview)
+		&& ['pending', 'active'].includes(base.state) && typeof base.enabled === 'boolean'
+		&& Number.isSafeInteger(base.expiresAt) && base.expiresAt >= 0
+		&& Number.isSafeInteger(base.createdAt) && base.createdAt >= 0
+		&& Number.isSafeInteger(base.updatedAt) && base.updatedAt >= base.createdAt
+		&& Number.isSafeInteger(base.revision) && base.revision >= 1
+		&& (base.disableReason === null || base.disableReason === 'manual')
+		&& (base.enabled === true ? base.disableReason === null : base.state === 'active' ? base.disableReason === 'manual' : base.disableReason === null);
+	if (!valid) throw new Error('Invalid membership customer base record');
+	return { ...base, uuid: normalizedUuid };
+}
+
+function parseMembershipUsageRecord(rawUsage) {
+	const usage = parseMembershipRecordJson(rawUsage, 'Invalid membership usage record');
+	const fields = ['schemaVersion', 'kind', 'customerId', 'quotaBytes', 'settledUsedBytes', 'quotaExceeded', 'usageUpdatedAt', 'usageSettledThrough', 'unlimitedTraffic', 'revision'];
+	const valid = hasOnlyFields(usage, fields) && Object.keys(usage).length === fields.length
+		&& usage.schemaVersion === 4 && usage.kind === 'membership-usage'
+		&& typeof usage.customerId === 'string' && /^cus_[A-Za-z0-9_-]{16,128}$/.test(usage.customerId)
+		&& Number.isSafeInteger(usage.settledUsedBytes) && usage.settledUsedBytes >= 0
+		&& Number.isSafeInteger(usage.usageUpdatedAt) && usage.usageUpdatedAt >= 0
+		&& Number.isSafeInteger(usage.usageSettledThrough) && usage.usageSettledThrough >= 0
+		&& typeof usage.quotaExceeded === 'boolean' && typeof usage.unlimitedTraffic === 'boolean'
+		&& (usage.unlimitedTraffic === true ? usage.quotaBytes === null : Number.isSafeInteger(usage.quotaBytes) && usage.quotaBytes > 0)
+		&& Number.isSafeInteger(usage.revision) && usage.revision >= 1;
+	if (!valid) throw new Error('Invalid membership usage record');
+	return usage;
+}
+
+function mergeMembershipCustomerRecords(base, usage) {
+	const parsedBase = parseMembershipCustomerBase(base), parsedUsage = parseMembershipUsageRecord(usage);
+	if (parsedBase.customerId !== parsedUsage.customerId) throw new Error('Membership record customer mismatch');
+	return parseMembershipCustomer({
+		schemaVersion: 4,
+		customerId: parsedBase.customerId,
+		name: parsedBase.name,
+		remark: parsedBase.remark,
+		uuid: parsedBase.uuid,
+		tokenHash: parsedBase.tokenHash,
+		tokenPreview: parsedBase.tokenPreview,
+		state: parsedBase.state,
+		enabled: parsedBase.enabled,
+		expiresAt: parsedBase.expiresAt,
+		createdAt: parsedBase.createdAt,
+		updatedAt: parsedBase.updatedAt,
+		revision: parsedBase.revision,
+		disableReason: parsedBase.disableReason,
+		quotaBytes: parsedUsage.quotaBytes,
+		settledUsedBytes: parsedUsage.settledUsedBytes,
+		quotaExceeded: parsedUsage.quotaExceeded,
+		usageUpdatedAt: parsedUsage.usageUpdatedAt,
+		usageSettledThrough: parsedUsage.usageSettledThrough,
+		unlimitedTraffic: parsedUsage.unlimitedTraffic,
+		usageRevision: parsedUsage.revision,
+	});
+}
+
+function buildMembershipCustomerBase(customer) {
+	const parsed = parseMembershipCustomer(customer);
+	return parseMembershipCustomerBase({
+		schemaVersion: 4, kind: 'membership-customer', customerId: parsed.customerId,
+		name: parsed.name, remark: parsed.remark, uuid: parsed.uuid, tokenHash: parsed.tokenHash, tokenPreview: parsed.tokenPreview,
+		state: parsed.state, enabled: parsed.enabled, expiresAt: parsed.expiresAt, createdAt: parsed.createdAt,
+		updatedAt: parsed.updatedAt, revision: parsed.revision, disableReason: parsed.disableReason,
+	});
+}
+
+function buildMembershipUsageRecord(customer) {
+	const parsed = parseMembershipCustomer(customer);
+	return parseMembershipUsageRecord({
+		schemaVersion: 4, kind: 'membership-usage', customerId: parsed.customerId,
+		quotaBytes: parsed.quotaBytes, settledUsedBytes: parsed.settledUsedBytes,
+		quotaExceeded: parsed.unlimitedTraffic === false && parsed.settledUsedBytes >= parsed.quotaBytes,
+		usageUpdatedAt: parsed.usageUpdatedAt, usageSettledThrough: parsed.usageSettledThrough,
+		unlimitedTraffic: parsed.unlimitedTraffic, revision: parsed.schemaVersion === 4 ? parsed.usageRevision : parsed.revision,
+	});
+}
+
+function promoteMembershipCustomer(customer) {
+	const parsed = parseMembershipCustomer(customer);
+	if (parsed.schemaVersion === 4) return parsed;
+	return parseMembershipCustomer({ ...parsed, schemaVersion: 4, usageRevision: parsed.revision });
+}
+
+async function loadMembershipCustomerFromMain(env, rawMain, expectedCustomerId) {
+	const decodedMain = parseMembershipRecordJson(rawMain, 'Invalid membership customer record');
+	if (decodedMain?.schemaVersion === 4) {
+		const base = parseMembershipCustomerBase(decodedMain);
+		if (base.customerId !== expectedCustomerId) throw new Error('Membership customer mismatch');
+		const rawUsage = await readMembershipRecord(env, MEMBERSHIP_USAGE_KEY_PREFIX + base.customerId);
+		if (rawUsage === null || rawUsage === undefined) throw new Error('Missing membership usage record');
+		return mergeMembershipCustomerRecords(base, rawUsage);
+	}
+	const customer = parseMembershipCustomer(decodedMain);
+	if (customer.customerId !== expectedCustomerId) throw new Error('Membership customer mismatch');
+	return customer;
+}
+
+function isCustomerTrafficEligible(customer) {
+	return customer?.unlimitedTraffic === true
+		|| (customer?.unlimitedTraffic === false
+			&& Number.isSafeInteger(customer.quotaBytes) && customer.quotaBytes > 0
+			&& Number.isSafeInteger(customer.settledUsedBytes) && customer.settledUsedBytes >= 0
+			&& customer.settledUsedBytes < customer.quotaBytes);
+}
+
+function buildCustomerTrafficPlan(customer, { unlimitedTraffic, quotaBytes }) {
+	const parsed = parseMembershipCustomer(customer);
+	const normalizedPlan = unlimitedTraffic === true
+		? { unlimitedTraffic: true, quotaBytes: null }
+		: { unlimitedTraffic: false, quotaBytes };
+	if (normalizedPlan.unlimitedTraffic === false && (!Number.isSafeInteger(normalizedPlan.quotaBytes) || normalizedPlan.quotaBytes <= 0)) throw createAdminCustomerError('invalid_input');
+	return parseMembershipCustomer({
+		...parsed,
+		...normalizedPlan,
+		quotaExceeded: normalizedPlan.unlimitedTraffic === false && parsed.settledUsedBytes >= normalizedPlan.quotaBytes,
+	});
+}
+
+function addCustomerTrafficQuota(customer, additionalBytes) {
+	const parsed = parseMembershipCustomer(customer);
+	if (parsed.unlimitedTraffic) throw createAdminCustomerError('quota_unlimited');
+	if (!Number.isSafeInteger(additionalBytes) || additionalBytes <= 0) throw createAdminCustomerError('invalid_input');
+	const quotaBytes = parsed.quotaBytes + additionalBytes;
+	if (!Number.isSafeInteger(quotaBytes) || quotaBytes <= parsed.quotaBytes) throw createAdminCustomerError('invalid_input');
+	return buildCustomerTrafficPlan(parsed, { unlimitedTraffic: false, quotaBytes });
+}
+
+function applyCustomerUsageSettlement(customer, additionalBytes, usageSettledThrough, now = Date.now()) {
+	const parsed = parseMembershipCustomer(customer);
+	if (!Number.isSafeInteger(additionalBytes) || additionalBytes < 0) throw createAdminCustomerError('invalid_input');
+	if (!Number.isSafeInteger(usageSettledThrough) || usageSettledThrough < parsed.usageSettledThrough) throw createAdminCustomerError('invalid_record');
+	if (!Number.isSafeInteger(now) || now < 0) throw createAdminCustomerError('invalid_record');
+	const settledUsedBytes = parsed.settledUsedBytes + additionalBytes;
+	if (!Number.isSafeInteger(settledUsedBytes) || settledUsedBytes < parsed.settledUsedBytes) throw createAdminCustomerError('invalid_record');
+	return parseMembershipCustomer({
+		...parsed,
+		settledUsedBytes,
+		quotaExceeded: parsed.unlimitedTraffic === false && settledUsedBytes >= parsed.quotaBytes,
+		usageUpdatedAt: now,
+		usageSettledThrough,
+	});
+}
+
+function resetCustomerSettledUsage(customer, now = Date.now()) {
+	const parsed = parseMembershipCustomer(customer);
+	if (!Number.isSafeInteger(now) || now < 0) throw createAdminCustomerError('invalid_record');
+	return parseMembershipCustomer({ ...parsed, settledUsedBytes: 0, quotaExceeded: false, usageUpdatedAt: now });
+}
+
+function setCustomerSettledUsage(customer, usedBytes, now = Date.now()) {
+	const parsed = parseMembershipCustomer(customer);
+	if (!Number.isSafeInteger(usedBytes) || usedBytes < 0) throw createAdminCustomerError('invalid_input');
+	if (!Number.isSafeInteger(now) || now < 0) throw createAdminCustomerError('invalid_record');
+	return parseMembershipCustomer({
+		...parsed,
+		settledUsedBytes: usedBytes,
+		quotaExceeded: parsed.unlimitedTraffic === false && usedBytes >= parsed.quotaBytes,
+		usageUpdatedAt: now,
+	});
 }
 
 function createMembershipLookupError(reason) {
@@ -154,7 +434,7 @@ async function loadCustomerByToken(env, rawToken) {
 		pointer = parseMembershipPointer(rawPointer);
 		const rawCustomer = await readMembershipRecord(env, MEMBERSHIP_CUSTOMER_KEY_PREFIX + pointer.customerId);
 		if (rawCustomer === null || rawCustomer === undefined) throw createMembershipLookupError('invalid_record');
-		customer = parseMembershipCustomer(rawCustomer);
+		customer = await loadMembershipCustomerFromMain(env, rawCustomer, pointer.customerId);
 	} catch (error) {
 		if (String(error?.code || '').startsWith('membership_')) throw error;
 		throw createMembershipLookupError('invalid_record');
@@ -175,7 +455,7 @@ async function loadCustomerByUuid(env, uuid) {
 		pointer = parseMembershipPointer(rawPointer);
 		const rawCustomer = await readMembershipRecord(env, MEMBERSHIP_CUSTOMER_KEY_PREFIX + pointer.customerId);
 		if (rawCustomer === null || rawCustomer === undefined) throw createMembershipLookupError('invalid_record');
-		customer = parseMembershipCustomer(rawCustomer);
+		customer = await loadMembershipCustomerFromMain(env, rawCustomer, pointer.customerId);
 	} catch (error) {
 		if (String(error?.code || '').startsWith('membership_')) throw error;
 		throw createMembershipLookupError('invalid_record');
@@ -214,6 +494,7 @@ function validateCustomerStatus(customer, now = Date.now()) {
 	if (parsedCustomer.state !== 'active') return { ok: false, reason: 'pending' };
 	if (parsedCustomer.enabled !== true) return { ok: false, reason: 'disabled' };
 	if (now >= parsedCustomer.expiresAt) return { ok: false, reason: 'expired' };
+	if (!isCustomerTrafficEligible(parsedCustomer)) return { ok: false, reason: 'quota_exceeded' };
 	return { ok: true, reason: null };
 }
 
@@ -246,6 +527,36 @@ function normalizeAdminCustomerRemark(value) {
 function validateAdminDurationDays(value) {
 	if (!Number.isInteger(value) || value < 1 || value > 3650) throw createAdminCustomerError('invalid_input');
 	return value;
+}
+
+function validateAdminQuotaGiB(value) {
+	if (!Number.isInteger(value) || value < 1 || value > MEMBERSHIP_MAX_QUOTA_GIB) throw createAdminCustomerError('invalid_input');
+	const quotaBytes = value * MEMBERSHIP_GIB_BYTES;
+	if (!Number.isSafeInteger(quotaBytes) || quotaBytes <= 0) throw createAdminCustomerError('invalid_input');
+	return quotaBytes;
+}
+
+function validateAdminUsedGiB(value) {
+	if (!Number.isSafeInteger(value) || value < 0) throw createAdminCustomerError('invalid_input');
+	const usedBytes = value * MEMBERSHIP_GIB_BYTES;
+	if (!Number.isSafeInteger(usedBytes) || usedBytes < 0) throw createAdminCustomerError('invalid_input');
+	return usedBytes;
+}
+
+function parseAdminTrafficPlan(body, allowMissing = false) {
+	const hasQuotaGiB = Object.prototype.hasOwnProperty.call(body, 'quotaGiB');
+	const hasUnlimitedTraffic = Object.prototype.hasOwnProperty.call(body, 'unlimitedTraffic');
+	if (!hasQuotaGiB && !hasUnlimitedTraffic) {
+		if (allowMissing) return { unlimitedTraffic: true, quotaBytes: null };
+		throw createAdminCustomerError('invalid_input');
+	}
+	if (hasUnlimitedTraffic && typeof body.unlimitedTraffic !== 'boolean') throw createAdminCustomerError('invalid_input');
+	if (body.unlimitedTraffic === true) {
+		if (hasQuotaGiB) throw createAdminCustomerError('invalid_input');
+		return { unlimitedTraffic: true, quotaBytes: null };
+	}
+	if (!hasQuotaGiB) throw createAdminCustomerError('invalid_input');
+	return { unlimitedTraffic: false, quotaBytes: validateAdminQuotaGiB(body.quotaGiB) };
 }
 
 async function parseAdminJsonBody(request, maxBytes = 8 * 1024) {
@@ -321,9 +632,180 @@ function generateMembershipToken() {
 	return randomMembershipBase64Url(32);
 }
 
+function encodeMembershipBase64Url(bytes) {
+	return btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function decodeMembershipBase64Url(value) {
+	if (typeof value !== 'string' || !/^[A-Za-z0-9_-]+$/.test(value)) throw createAdminCustomerError('invalid_record');
+	const padded = value.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - value.length % 4) % 4);
+	try {
+		return Uint8Array.from(atob(padded), character => character.charCodeAt(0));
+	} catch (_) {
+		throw createAdminCustomerError('invalid_record');
+	}
+}
+
+function validateCreateIdempotencyKey(value) {
+	if (typeof value !== 'string' || !/^[A-Za-z0-9_-]{16,128}$/.test(value)) throw createAdminCustomerError('invalid_input');
+	return value;
+}
+
+async function getCreateRequestHmacKey(legacyContext) {
+	const secret = [legacyContext?.adminPassword, legacyContext?.encryptionKey, legacyContext?.userID].map(value => String(value || '')).join('\u0000');
+	if (secret.replace(/\u0000/g, '').length < 16) throw createAdminCustomerError('kv_unavailable');
+	const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('membership-create-v1\u0000' + secret));
+	return crypto.subtle.importKey('raw', digest, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+}
+
+async function deriveCreateRequestBytes(legacyContext, idempotencyKey, purpose) {
+	const key = await getCreateRequestHmacKey(legacyContext);
+	const signature = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(purpose + '\u0000' + idempotencyKey));
+	return new Uint8Array(signature);
+}
+
+async function deriveCreateCandidate(legacyContext, idempotencyKey) {
+	const [customerBytes, uuidBytes, tokenBytes] = await Promise.all([
+		deriveCreateRequestBytes(legacyContext, idempotencyKey, 'customer-id'),
+		deriveCreateRequestBytes(legacyContext, idempotencyKey, 'uuid'),
+		deriveCreateRequestBytes(legacyContext, idempotencyKey, 'token'),
+	]);
+	const uuidData = uuidBytes.slice(0, 16);
+	uuidData[6] = (uuidData[6] & 0x0f) | 0x40;
+	uuidData[8] = (uuidData[8] & 0x3f) | 0x80;
+	const uuidHex = Array.from(uuidData, byte => byte.toString(16).padStart(2, '0'));
+	const uuid = `${uuidHex.slice(0, 4).join('')}-${uuidHex.slice(4, 6).join('')}-${uuidHex.slice(6, 8).join('')}-${uuidHex.slice(8, 10).join('')}-${uuidHex.slice(10).join('')}`;
+	const rawToken = encodeMembershipBase64Url(tokenBytes);
+	return {
+		customerId: 'cus_' + encodeMembershipBase64Url(customerBytes.slice(0, 18)),
+		uuid,
+		rawToken,
+		tokenHash: await hashMembershipToken(rawToken),
+	};
+}
+
+async function hashCreateRequestPayload(payload) {
+	const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(payload)));
+	return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+async function getCreateRequestEncryptionKey(legacyContext, idempotencyKey) {
+	const bytes = await deriveCreateRequestBytes(legacyContext, idempotencyKey, 'encrypted-result');
+	return crypto.subtle.importKey('raw', bytes, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+}
+
+async function encryptCreateRequestResult(legacyContext, idempotencyKey, result) {
+	const iv = crypto.getRandomValues(new Uint8Array(12));
+	const key = await getCreateRequestEncryptionKey(legacyContext, idempotencyKey);
+	const encrypted = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(JSON.stringify(result)));
+	return { iv: encodeMembershipBase64Url(iv), ciphertext: encodeMembershipBase64Url(new Uint8Array(encrypted)) };
+}
+
+async function decryptCreateRequestResult(legacyContext, idempotencyKey, encryptedResult) {
+	if (!isPlainObject(encryptedResult) || Object.keys(encryptedResult).length !== 2 || typeof encryptedResult.iv !== 'string' || typeof encryptedResult.ciphertext !== 'string') throw createAdminCustomerError('invalid_record');
+	try {
+		const key = await getCreateRequestEncryptionKey(legacyContext, idempotencyKey);
+		const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: decodeMembershipBase64Url(encryptedResult.iv) }, key, decodeMembershipBase64Url(encryptedResult.ciphertext));
+		return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(decrypted));
+	} catch (_) {
+		throw createAdminCustomerError('invalid_record');
+	}
+}
+
+function parseCreateRequestRecord(rawRecord) {
+	const record = parseMembershipRecordJson(rawRecord, 'Invalid membership create request record');
+	const baseFields = ['schemaVersion', 'kind', 'state', 'requestHash', 'candidateHash', 'createdAt', 'updatedAt'];
+	const fields = record?.state === 'succeeded' ? [...baseFields, 'encryptedResult'] : baseFields;
+	const valid = hasOnlyFields(record, fields) && Object.keys(record).length === fields.length
+		&& record.schemaVersion === 1 && record.kind === 'membership-create-request'
+		&& ['processing', 'succeeded'].includes(record.state)
+		&& typeof record.requestHash === 'string' && /^[0-9a-f]{64}$/.test(record.requestHash)
+		&& typeof record.candidateHash === 'string' && /^[0-9a-f]{64}$/.test(record.candidateHash)
+		&& Number.isSafeInteger(record.createdAt) && record.createdAt >= 0
+		&& Number.isSafeInteger(record.updatedAt) && record.updatedAt >= record.createdAt
+		&& (record.state !== 'succeeded' || isPlainObject(record.encryptedResult));
+	if (!valid) throw createAdminCustomerError('invalid_record');
+	return record;
+}
+
+async function putCreateRequestRecord(env, idempotencyKey, record) {
+	if (!env?.KV || typeof env.KV.put !== 'function') throw createAdminCustomerError('kv_unavailable');
+	try {
+		await env.KV.put(MEMBERSHIP_CREATE_REQUEST_KEY_PREFIX + idempotencyKey, JSON.stringify(parseCreateRequestRecord(record)), { expirationTtl: MEMBERSHIP_CREATE_REQUEST_TTL_SECONDS });
+	} catch (_) {
+		throw createAdminCustomerError('kv_failed');
+	}
+}
+
+async function putCreateResultRecord(env, idempotencyKey, record) {
+	if (!env?.KV || typeof env.KV.put !== 'function') throw createAdminCustomerError('kv_unavailable');
+	try {
+		await env.KV.put(MEMBERSHIP_CREATE_RESULT_KEY_PREFIX + idempotencyKey, JSON.stringify(parseCreateRequestRecord(record)), { expirationTtl: MEMBERSHIP_CREATE_REQUEST_TTL_SECONDS });
+	} catch (_) {
+		throw createAdminCustomerError('kv_failed');
+	}
+}
+
 function buildMembershipPointer(customerId) {
 	if (typeof customerId !== 'string' || !/^cus_[A-Za-z0-9_-]{16,128}$/.test(customerId)) throw createAdminCustomerError('invalid_record');
 	return { schemaVersion: 2, customerId, kind: 'membership-pointer' };
+}
+
+async function loadCompletedCreateCustomer(env, candidate) {
+	if (!env?.KV || typeof env.KV.get !== 'function') throw createAdminCustomerError('kv_unavailable');
+	let rawBase, rawUsage, rawUuidPointer, rawTokenPointer;
+	try {
+		[rawBase, rawUsage, rawUuidPointer, rawTokenPointer] = await Promise.all([
+			env.KV.get(MEMBERSHIP_CUSTOMER_KEY_PREFIX + candidate.customerId),
+			env.KV.get(MEMBERSHIP_USAGE_KEY_PREFIX + candidate.customerId),
+			env.KV.get(MEMBERSHIP_UUID_KEY_PREFIX + candidate.uuid),
+			env.KV.get(MEMBERSHIP_TOKEN_KEY_PREFIX + candidate.tokenHash),
+		]);
+	} catch (_) {
+		throw createAdminCustomerError('kv_failed');
+	}
+	try {
+		const hasBase = rawBase !== null && rawBase !== undefined, hasUsage = rawUsage !== null && rawUsage !== undefined;
+		const hasUuidPointer = rawUuidPointer !== null && rawUuidPointer !== undefined, hasTokenPointer = rawTokenPointer !== null && rawTokenPointer !== undefined;
+		let base = null, usage = null, uuidPointer = null, tokenPointer = null;
+		if (hasBase) {
+			base = parseMembershipCustomerBase(rawBase);
+			if (base.customerId !== candidate.customerId || base.uuid !== candidate.uuid || base.tokenHash !== candidate.tokenHash) throw new Error('Create result mismatch');
+		}
+		if (hasUsage) {
+			usage = parseMembershipUsageRecord(rawUsage);
+			if (usage.customerId !== candidate.customerId) throw new Error('Create result mismatch');
+		}
+		if (hasUuidPointer) {
+			uuidPointer = parseMembershipPointer(rawUuidPointer);
+			if (uuidPointer.customerId !== candidate.customerId) throw new Error('Create result mismatch');
+		}
+		if (hasTokenPointer) {
+			tokenPointer = parseMembershipPointer(rawTokenPointer);
+			if (tokenPointer.customerId !== candidate.customerId) throw new Error('Create result mismatch');
+		}
+		if (!hasBase || !hasUsage || !hasUuidPointer || !hasTokenPointer) return null;
+		const customer = mergeMembershipCustomerRecords(base, usage);
+		if (customer.state !== 'active') throw new Error('Create result mismatch');
+		return customer;
+	} catch (_) {
+		throw createAdminCustomerError('invalid_record');
+	}
+}
+
+function buildCreateCustomerResult(request, customer, rawToken) {
+	const subscriptionUrl = new URL('/sub', request.url);
+	subscriptionUrl.searchParams.set('token', rawToken);
+	return { customer: toCustomerDetail(customer), rawToken, subscriptionUrl: subscriptionUrl.toString(), secretReturnedOnce: true };
+}
+
+function validateRecoveredCreateResult(result, candidate) {
+	if (!isPlainObject(result) || !isPlainObject(result.customer)
+		|| Object.keys(result).length !== 4
+		|| typeof result.rawToken !== 'string' || result.rawToken !== candidate.rawToken
+		|| result.customer.customerId !== candidate.customerId || result.customer.uuid !== candidate.uuid
+		|| typeof result.subscriptionUrl !== 'string' || result.secretReturnedOnce !== true) throw createAdminCustomerError('invalid_record');
+	return result;
 }
 
 function toCustomerDetail(customer) {
@@ -338,7 +820,18 @@ function toCustomerDetail(customer) {
 		expiresAt: parsed.expiresAt,
 		createdAt: parsed.createdAt,
 		updatedAt: parsed.updatedAt,
+		revision: parsed.revision,
+		usageRevision: parsed.schemaVersion === 4 ? parsed.usageRevision : parsed.revision,
 		tokenPreview: parsed.tokenPreview,
+		quotaBytes: parsed.quotaBytes,
+		settledUsedBytes: parsed.settledUsedBytes,
+		remainingBytes: parsed.unlimitedTraffic ? null : Math.max(0, parsed.quotaBytes - parsed.settledUsedBytes),
+		quotaExceeded: parsed.unlimitedTraffic === false && parsed.settledUsedBytes >= parsed.quotaBytes,
+		usageUpdatedAt: parsed.usageUpdatedAt,
+		usageSettledThrough: parsed.usageSettledThrough,
+		unlimitedTraffic: parsed.unlimitedTraffic,
+		disableReason: parsed.disableReason,
+		trafficEligible: isCustomerTrafficEligible(parsed),
 	};
 }
 
@@ -347,6 +840,23 @@ function toCustomerSummary(customer, now = Date.now()) {
 	return { ...detail, expired: now >= detail.expiresAt };
 }
 
+async function loadCustomerForList(env, customerId, rawCustomer) {
+	const decodedCustomer = parseMembershipRecordJson(rawCustomer, 'Invalid membership customer record');
+	if (decodedCustomer?.schemaVersion === 1) throw createAdminCustomerError('migration_required');
+	if (decodedCustomer?.schemaVersion === 4) {
+		const base = parseMembershipCustomerBase(decodedCustomer);
+		if (base.customerId !== customerId) throw createAdminCustomerError('invalid_record');
+		let rawUsage;
+		try { rawUsage = await readMembershipRecord(env, MEMBERSHIP_USAGE_KEY_PREFIX + customerId); } catch (_) { throw createAdminCustomerError('kv_failed'); }
+		if (rawUsage === null || rawUsage === undefined) {
+			return parseMembershipCustomer({ schemaVersion: 3, customerId: base.customerId, name: base.name, remark: base.remark, uuid: base.uuid, tokenHash: base.tokenHash, tokenPreview: base.tokenPreview, state: base.state, enabled: base.enabled, expiresAt: base.expiresAt, createdAt: base.createdAt, updatedAt: base.updatedAt, revision: base.revision, quotaBytes: null, settledUsedBytes: 0, quotaExceeded: false, usageUpdatedAt: 0, usageSettledThrough: 0, unlimitedTraffic: true, disableReason: base.disableReason });
+		}
+		return mergeMembershipCustomerRecords(base, rawUsage);
+	}
+	const customer = parseMembershipCustomer(decodedCustomer);
+	if (customer.customerId !== customerId) throw createAdminCustomerError('invalid_record');
+	return customer;
+}
 async function loadCustomerById(env, customerId) {
 	if (!/^cus_[A-Za-z0-9_-]{16,128}$/.test(customerId) || !env?.KV || typeof env.KV.get !== 'function') throw createAdminCustomerError('kv_unavailable');
 	let rawCustomer;
@@ -364,7 +874,7 @@ async function loadCustomerById(env, customerId) {
 			if (legacyPointer.schemaVersion !== 1 || legacyPointer.customerId !== customerId) throw createAdminCustomerError('invalid_record');
 			throw createAdminCustomerError('migration_required');
 		}
-		const customer = validateCustomerAdminRecord(decodedCustomer);
+		const customer = validateCustomerAdminRecord(await loadMembershipCustomerFromMain(env, decodedCustomer, customerId));
 		if (customer.customerId !== customerId) throw createAdminCustomerError('invalid_record');
 		return customer;
 	} catch (error) {
@@ -373,15 +883,40 @@ async function loadCustomerById(env, customerId) {
 	}
 }
 
-async function putCustomerMainRecord(env, customer) {
+async function putCustomerBaseRecord(env, customer) {
 	if (!env?.KV || typeof env.KV.put !== 'function') throw createAdminCustomerError('kv_unavailable');
-	const parsed = validateCustomerAdminRecord(customer);
+	const parsed = buildMembershipCustomerBase(customer);
 	try {
 		await env.KV.put(MEMBERSHIP_CUSTOMER_KEY_PREFIX + parsed.customerId, JSON.stringify(parsed));
 	} catch (_) {
 		throw createAdminCustomerError('kv_failed');
 	}
 	return parsed;
+}
+
+async function putCustomerUsageRecord(env, customer) {
+	if (!env?.KV || typeof env.KV.put !== 'function') throw createAdminCustomerError('kv_unavailable');
+	const parsed = buildMembershipUsageRecord(customer);
+	try {
+		await env.KV.put(MEMBERSHIP_USAGE_KEY_PREFIX + parsed.customerId, JSON.stringify(parsed));
+	} catch (_) {
+		throw createAdminCustomerError('kv_failed');
+	}
+	return parsed;
+}
+
+async function persistCustomerBaseMutation(env, originalCustomer, updatedCustomer) {
+	const original = validateCustomerAdminRecord(originalCustomer), updated = validateCustomerAdminRecord(updatedCustomer);
+	if (original.schemaVersion !== 4) await putCustomerUsageRecord(env, original);
+	await putCustomerBaseRecord(env, updated);
+	return updated;
+}
+
+async function persistCustomerUsageMutation(env, originalCustomer, updatedCustomer) {
+	const original = validateCustomerAdminRecord(originalCustomer), updated = validateCustomerAdminRecord(updatedCustomer);
+	await putCustomerUsageRecord(env, updated);
+	if (original.schemaVersion !== 4) await putCustomerBaseRecord(env, original);
+	return updated;
 }
 
 async function putMembershipPointer(env, key, customerId) {
@@ -426,6 +961,24 @@ function nextCustomerRevision(customer) {
 	return revision;
 }
 
+function nextCustomerUsageRevision(customer) {
+	const revision = (customer.schemaVersion === 4 ? customer.usageRevision : customer.revision) + 1;
+	if (!Number.isSafeInteger(revision) || revision < 2) throw createAdminCustomerError('invalid_record');
+	return revision;
+}
+
+function nextCustomerUsageUpdatedAt(customer) {
+	const updatedAt = Math.max(Date.now(), customer.usageUpdatedAt + 1);
+	if (!Number.isSafeInteger(updatedAt)) throw createAdminCustomerError('invalid_record');
+	return updatedAt;
+}
+
+function validateExpectedRevision(value, currentRevision) {
+	if (!Number.isSafeInteger(value) || value < 1) throw createAdminCustomerError('invalid_input');
+	if (value !== currentRevision) throw createAdminCustomerError('revision_conflict');
+	return value;
+}
+
 function validateAdminBodyFields(body, allowedFields, requiredFields = []) {
 	if (!hasOnlyFields(body, allowedFields) || !requiredFields.every(field => Object.prototype.hasOwnProperty.call(body, field))) throw createAdminCustomerError('invalid_input');
 	return body;
@@ -444,7 +997,7 @@ async function handleAdminCustomerApi(request, env, route, legacyContext) {
 		if (!parsedBody.ok) return parsedBody.response;
 		body = parsedBody.value;
 	}
-	const requiredKvMethods = route.route === 'customers' && method === 'GET' ? ['get', 'list'] : route.route === 'customers' ? ['get', 'put', 'delete'] : ['get', 'put'];
+	const requiredKvMethods = route.route === 'customers' && method === 'GET' ? ['get', 'list'] : ['get', 'put'];
 	if (!env?.KV || requiredKvMethods.some(kvMethod => typeof env.KV[kvMethod] !== 'function')) return createAdminApiResponse({ error: { code: 'service_unavailable', message: 'Membership customer service is temporarily unavailable' } }, 503);
 
 	try {
@@ -469,12 +1022,15 @@ async function handleAdminCustomerApi(request, env, route, legacyContext) {
 				const customerId = key.name.slice(MEMBERSHIP_CUSTOMER_KEY_PREFIX.length);
 				if (!/^cus_[A-Za-z0-9_-]{16,128}$/.test(customerId)) return { item: null, issue: 'invalid' };
 				try {
-					const customer = await loadCustomerById(env, customerId);
+					const rawCustomer = await readMembershipRecord(env, MEMBERSHIP_CUSTOMER_KEY_PREFIX + customerId);
+				if (rawCustomer === null || rawCustomer === undefined) return { item: null, issue: 'invalid' };
+				const customer = await loadCustomerForList(env, customerId, rawCustomer);
 					return { item: customer ? toCustomerSummary(customer, now) : null, issue: null };
 				} catch (error) {
 					if (error?.code === 'migration_required') return { item: null, issue: 'migration_required' };
 					if (error?.code === 'invalid_record') return { item: null, issue: 'invalid' };
-					throw error;
+				if (String(error?.code || '').includes('kv_') || String(error?.code || '').startsWith('membership_')) throw error;
+				return { item: null, issue: 'invalid' };
 				}
 			});
 			const nextCursor = page.list_complete === true ? null : (typeof page.cursor === 'string' && page.cursor ? page.cursor : null);
@@ -487,31 +1043,64 @@ async function handleAdminCustomerApi(request, env, route, legacyContext) {
 		}
 
 		if (route.route === 'customers' && method === 'POST') {
-			validateAdminBodyFields(body, ['name', 'remark', 'durationDays'], ['name', 'durationDays']);
+			validateAdminBodyFields(body, ['name', 'remark', 'durationDays', 'quotaGiB', 'unlimitedTraffic', 'idempotencyKey'], ['name', 'durationDays', 'idempotencyKey']);
 			const name = normalizeAdminCustomerName(body.name), remark = body.remark === undefined ? '' : normalizeAdminCustomerRemark(body.remark), durationDays = validateAdminDurationDays(body.durationDays);
-			if (!env?.KV || typeof env.KV.get !== 'function' || typeof env.KV.put !== 'function' || typeof env.KV.delete !== 'function') throw createAdminCustomerError('kv_unavailable');
+			const trafficPlan = parseAdminTrafficPlan(body, true), idempotencyKey = validateCreateIdempotencyKey(body.idempotencyKey);
+			if (!env?.KV || typeof env.KV.get !== 'function' || typeof env.KV.put !== 'function') throw createAdminCustomerError('kv_unavailable');
 			const legacyUuid = String(legacyContext.userID || '').toLowerCase(), legacyToken = await MD5MD5(legacyContext.host + legacyContext.userID);
-			let candidate = null;
-			for (let attempt = 0; attempt < 5 && !candidate; attempt++) {
-				const customerId = generateCustomerId(), uuid = crypto.randomUUID().toLowerCase(), rawToken = generateMembershipToken(), tokenHash = await hashMembershipToken(rawToken);
-				if (!tokenHash || uuid === legacyUuid || rawToken === legacyToken) continue;
-				let existing;
-				try {
-					existing = await Promise.all([
-						env.KV.get(MEMBERSHIP_CUSTOMER_KEY_PREFIX + customerId),
-						env.KV.get(MEMBERSHIP_UUID_KEY_PREFIX + uuid),
-						env.KV.get(MEMBERSHIP_TOKEN_KEY_PREFIX + tokenHash),
-					]);
-				} catch (_) {
-					throw createAdminCustomerError('kv_failed');
-				}
-				if (existing.every(value => value === null || value === undefined)) candidate = { customerId, uuid, rawToken, tokenHash };
+			const canonicalRequest = { name, remark, durationDays, quotaBytes: trafficPlan.quotaBytes, unlimitedTraffic: trafficPlan.unlimitedTraffic };
+			const requestHash = await hashCreateRequestPayload(canonicalRequest), candidate = await deriveCreateCandidate(legacyContext, idempotencyKey);
+			const candidateHash = await hashCreateRequestPayload({ customerId: candidate.customerId, uuid: candidate.uuid, tokenHash: candidate.tokenHash });
+			if (!candidate.tokenHash || candidate.uuid === legacyUuid || candidate.rawToken === legacyToken) throw createAdminCustomerError('invalid_input');
+			let rawRequestRecord, rawResultRecord;
+			try {
+				[rawRequestRecord, rawResultRecord] = await Promise.all([
+					env.KV.get(MEMBERSHIP_CREATE_REQUEST_KEY_PREFIX + idempotencyKey),
+					env.KV.get(MEMBERSHIP_CREATE_RESULT_KEY_PREFIX + idempotencyKey),
+				]);
+			} catch (_) {
+				throw createAdminCustomerError('kv_failed');
 			}
-			if (!candidate) throw createAdminCustomerError('kv_failed');
-			const now = Date.now(), expiresAt = now + durationDays * 86400000;
+			if (rawResultRecord !== null && rawResultRecord !== undefined) {
+				const resultRecord = parseCreateRequestRecord(rawResultRecord);
+				if (resultRecord.state !== 'succeeded' || resultRecord.requestHash !== requestHash || resultRecord.candidateHash !== candidateHash) throw createAdminCustomerError('idempotency_conflict');
+				const recoveredResult = validateRecoveredCreateResult(await decryptCreateRequestResult(legacyContext, idempotencyKey, resultRecord.encryptedResult), candidate);
+				return createAdminApiResponse(recoveredResult, 201);
+			}
+			let processingRecord = rawRequestRecord === null || rawRequestRecord === undefined ? null : parseCreateRequestRecord(rawRequestRecord);
+			if (processingRecord && (processingRecord.requestHash !== requestHash || processingRecord.candidateHash !== candidateHash)) throw createAdminCustomerError('idempotency_conflict');
+			if (!processingRecord) {
+				const completedCustomer = await loadCompletedCreateCustomer(env, candidate);
+				if (completedCustomer) {
+					const expectedExpiresAt = completedCustomer.createdAt + durationDays * 86400000;
+					if (completedCustomer.name !== name || completedCustomer.remark !== remark || completedCustomer.expiresAt !== expectedExpiresAt
+						|| completedCustomer.quotaBytes !== trafficPlan.quotaBytes || completedCustomer.unlimitedTraffic !== trafficPlan.unlimitedTraffic) throw createAdminCustomerError('idempotency_conflict');
+					const result = buildCreateCustomerResult(request, completedCustomer, candidate.rawToken);
+					const recoveredAt = Date.now();
+					processingRecord = { schemaVersion: 1, kind: 'membership-create-request', state: 'processing', requestHash, candidateHash, createdAt: completedCustomer.createdAt, updatedAt: recoveredAt };
+					await putCreateRequestRecord(env, idempotencyKey, processingRecord);
+					await putCreateResultRecord(env, idempotencyKey, { ...processingRecord, state: 'succeeded', encryptedResult: await encryptCreateRequestResult(legacyContext, idempotencyKey, result) });
+					return createAdminApiResponse(result, 201);
+				}
+			}
+			if (processingRecord) {
+				const completedCustomer = await loadCompletedCreateCustomer(env, candidate);
+				if (completedCustomer) {
+					const result = buildCreateCustomerResult(request, completedCustomer, candidate.rawToken);
+					const succeededRecord = { ...processingRecord, state: 'succeeded', updatedAt: Date.now(), encryptedResult: await encryptCreateRequestResult(legacyContext, idempotencyKey, result) };
+					await putCreateResultRecord(env, idempotencyKey, succeededRecord);
+					return createAdminApiResponse(result, 201);
+				}
+				if (Date.now() - processingRecord.updatedAt < MEMBERSHIP_CREATE_PROCESSING_STALE_MS) return createAdminApiResponse({ error: { code: 'create_in_progress', message: 'Customer creation is still in progress' } }, 409);
+			}
+			const now = Date.now();
+			if (!processingRecord) processingRecord = { schemaVersion: 1, kind: 'membership-create-request', state: 'processing', requestHash, candidateHash, createdAt: now, updatedAt: now };
+			else processingRecord = { ...processingRecord, updatedAt: now };
+			await putCreateRequestRecord(env, idempotencyKey, processingRecord);
+			const expiresAt = processingRecord.createdAt + durationDays * 86400000;
 			if (!Number.isSafeInteger(expiresAt)) throw createAdminCustomerError('invalid_record');
 			const customer = validateCustomerAdminRecord({
-				schemaVersion: 2,
+				schemaVersion: 4,
 				customerId: candidate.customerId,
 				name,
 				remark,
@@ -521,35 +1110,35 @@ async function handleAdminCustomerApi(request, env, route, legacyContext) {
 				state: 'active',
 				enabled: true,
 				expiresAt,
-				createdAt: now,
-				updatedAt: now,
+				createdAt: processingRecord.createdAt,
+				updatedAt: processingRecord.createdAt,
 				revision: 1,
+				quotaBytes: trafficPlan.quotaBytes,
+				settledUsedBytes: 0,
+				quotaExceeded: false,
+				usageUpdatedAt: 0,
+				usageSettledThrough: 0,
+				unlimitedTraffic: trafficPlan.unlimitedTraffic,
+				disableReason: null,
+				usageRevision: 1,
 			});
-			const entries = {
-				uuid: MEMBERSHIP_UUID_KEY_PREFIX + candidate.uuid,
-				token: MEMBERSHIP_TOKEN_KEY_PREFIX + candidate.tokenHash,
-			};
-			const written = new Set();
-			try {
-				await putMembershipPointer(env, entries.uuid, candidate.customerId);
-				written.add('uuid');
-				await putMembershipPointer(env, entries.token, candidate.customerId);
-				written.add('token');
-				await putCustomerMainRecord(env, customer);
-			} catch (_) {
-				await cleanupCustomerCreationPointers(env, entries, written);
-				throw createAdminCustomerError('kv_failed');
-			}
-			const subscriptionUrl = new URL('/sub', request.url);
-			subscriptionUrl.searchParams.set('token', candidate.rawToken);
-			return createAdminApiResponse({ customer: toCustomerDetail(customer), rawToken: candidate.rawToken, subscriptionUrl: subscriptionUrl.toString(), secretReturnedOnce: true }, 201);
+			await putMembershipPointer(env, MEMBERSHIP_UUID_KEY_PREFIX + candidate.uuid, candidate.customerId);
+			await putMembershipPointer(env, MEMBERSHIP_TOKEN_KEY_PREFIX + candidate.tokenHash, candidate.customerId);
+			await putCustomerUsageRecord(env, customer);
+			await putCustomerBaseRecord(env, customer);
+			const result = buildCreateCustomerResult(request, customer, candidate.rawToken);
+			const succeededRecord = { ...processingRecord, state: 'succeeded', updatedAt: Date.now(), encryptedResult: await encryptCreateRequestResult(legacyContext, idempotencyKey, result) };
+			await putCreateResultRecord(env, idempotencyKey, succeededRecord);
+			return createAdminApiResponse(result, 201);
 		}
 
 		if (route.route === 'customer_detail') {
-			validateAdminBodyFields(body, ['name', 'remark']);
+			validateAdminBodyFields(body, ['name', 'remark', 'expectedRevision'], ['expectedRevision']);
 			if (!Object.prototype.hasOwnProperty.call(body, 'name') && !Object.prototype.hasOwnProperty.call(body, 'remark')) throw createAdminCustomerError('invalid_input');
-			const customer = await loadCustomerById(env, route.customerId);
-			if (!customer) return createAdminApiResponse({ error: { code: 'not_found', message: 'Customer not found' } }, 404);
+			const originalCustomer = await loadCustomerById(env, route.customerId);
+			if (!originalCustomer) return createAdminApiResponse({ error: { code: 'not_found', message: 'Customer not found' } }, 404);
+			validateExpectedRevision(body.expectedRevision, originalCustomer.revision);
+			const customer = promoteMembershipCustomer(originalCustomer);
 			const updated = validateCustomerAdminRecord({
 				...customer,
 				...(Object.prototype.hasOwnProperty.call(body, 'name') ? { name: normalizeAdminCustomerName(body.name) } : {}),
@@ -557,36 +1146,139 @@ async function handleAdminCustomerApi(request, env, route, legacyContext) {
 				updatedAt: nextCustomerUpdatedAt(customer),
 				revision: nextCustomerRevision(customer),
 			});
-			await putCustomerMainRecord(env, updated);
+			await persistCustomerBaseMutation(env, originalCustomer, updated);
 			return createAdminApiResponse({ customer: toCustomerDetail(updated) }, 200);
 		}
 
 		if (route.route === 'renew') {
-			validateAdminBodyFields(body, ['durationDays'], ['durationDays']);
-			const durationDays = validateAdminDurationDays(body.durationDays), customer = await loadCustomerById(env, route.customerId);
-			if (!customer) return createAdminApiResponse({ error: { code: 'not_found', message: 'Customer not found' } }, 404);
+			validateAdminBodyFields(body, ['durationDays', 'expectedRevision'], ['durationDays', 'expectedRevision']);
+			const durationDays = validateAdminDurationDays(body.durationDays), originalCustomer = await loadCustomerById(env, route.customerId);
+			if (!originalCustomer) return createAdminApiResponse({ error: { code: 'not_found', message: 'Customer not found' } }, 404);
+			validateExpectedRevision(body.expectedRevision, originalCustomer.revision);
+			const customer = promoteMembershipCustomer(originalCustomer);
 			if (customer.state !== 'active') throw createAdminCustomerError('pending_customer');
 			const now = Date.now(), expiresAt = (customer.expiresAt > now ? customer.expiresAt : now) + durationDays * 86400000;
 			if (!Number.isSafeInteger(expiresAt)) throw createAdminCustomerError('invalid_record');
 			const updated = validateCustomerAdminRecord({ ...customer, expiresAt, updatedAt: nextCustomerUpdatedAt(customer), revision: nextCustomerRevision(customer) });
-			await putCustomerMainRecord(env, updated);
+			await persistCustomerBaseMutation(env, originalCustomer, updated);
 			return createAdminApiResponse({ customer: toCustomerDetail(updated) }, 200);
 		}
 
 		if (route.route === 'toggle') {
-			validateAdminBodyFields(body, ['enabled'], ['enabled']);
+			validateAdminBodyFields(body, ['enabled', 'expectedRevision'], ['enabled', 'expectedRevision']);
 			if (typeof body.enabled !== 'boolean') throw createAdminCustomerError('invalid_input');
-			const customer = await loadCustomerById(env, route.customerId);
-			if (!customer) return createAdminApiResponse({ error: { code: 'not_found', message: 'Customer not found' } }, 404);
+			const originalCustomer = await loadCustomerById(env, route.customerId);
+			if (!originalCustomer) return createAdminApiResponse({ error: { code: 'not_found', message: 'Customer not found' } }, 404);
+			validateExpectedRevision(body.expectedRevision, originalCustomer.revision);
+			const customer = promoteMembershipCustomer(originalCustomer);
 			if (customer.state !== 'active') throw createAdminCustomerError('pending_customer');
 			if (customer.enabled === body.enabled) return createAdminApiResponse({ customer: toCustomerDetail(customer) }, 200);
-			const updated = validateCustomerAdminRecord({ ...customer, enabled: body.enabled, updatedAt: nextCustomerUpdatedAt(customer), revision: nextCustomerRevision(customer) });
-			await putCustomerMainRecord(env, updated);
+			const updated = validateCustomerAdminRecord({ ...customer, enabled: body.enabled, disableReason: body.enabled ? null : 'manual', updatedAt: nextCustomerUpdatedAt(customer), revision: nextCustomerRevision(customer) });
+			await persistCustomerBaseMutation(env, originalCustomer, updated);
+			return createAdminApiResponse({ customer: toCustomerDetail(updated) }, 200);
+		}
+
+		if (route.route === 'package') {
+			const allowedFields = ['durationDays', 'addQuotaGiB', 'quotaGiB', 'unlimitedTraffic', 'expectedRevision', 'expectedUsageRevision'];
+			validateAdminBodyFields(body, allowedFields);
+			const hasTimeChange = Object.prototype.hasOwnProperty.call(body, 'durationDays');
+			const hasUsageChange = Object.prototype.hasOwnProperty.call(body, 'addQuotaGiB')
+				|| Object.prototype.hasOwnProperty.call(body, 'quotaGiB')
+				|| Object.prototype.hasOwnProperty.call(body, 'unlimitedTraffic');
+			if (!hasTimeChange && !hasUsageChange) throw createAdminCustomerError('invalid_input');
+			if (hasTimeChange) {
+				validateAdminDurationDays(body.durationDays);
+			}
+			const originalCustomer = await loadCustomerById(env, route.customerId);
+			if (!originalCustomer) return createAdminApiResponse({ error: { code: 'not_found', message: 'Customer not found' } }, 404);
+			if (hasTimeChange) validateExpectedRevision(body.expectedRevision, originalCustomer.revision);
+			if (hasUsageChange) validateExpectedRevision(body.expectedUsageRevision, originalCustomer.schemaVersion === 4 ? originalCustomer.usageRevision : originalCustomer.revision);
+			const customer = promoteMembershipCustomer(originalCustomer);
+			if (customer.state !== 'active') throw createAdminCustomerError('pending_customer');
+			let updated = customer;
+			if (hasTimeChange) {
+				const now = Date.now(), expiresAt = (customer.expiresAt > now ? customer.expiresAt : now) + body.durationDays * 86400000;
+				if (!Number.isSafeInteger(expiresAt)) throw createAdminCustomerError('invalid_record');
+				updated = { ...updated, expiresAt, updatedAt: nextCustomerUpdatedAt(customer), revision: nextCustomerRevision(customer) };
+			}
+			if (hasUsageChange) {
+				let withUsage = updated;
+				if (Object.prototype.hasOwnProperty.call(body, 'addQuotaGiB')) {
+					if (Object.prototype.hasOwnProperty.call(body, 'quotaGiB') || Object.prototype.hasOwnProperty.call(body, 'unlimitedTraffic')) throw createAdminCustomerError('invalid_input');
+					withUsage = addCustomerTrafficQuota(updated, validateAdminQuotaGiB(body.addQuotaGiB));
+				} else {
+					withUsage = buildCustomerTrafficPlan(updated, parseAdminTrafficPlan(body));
+				}
+				updated = { ...withUsage, usageUpdatedAt: nextCustomerUsageUpdatedAt(customer), usageRevision: nextCustomerUsageRevision(customer) };
+			}
+			const validated = validateCustomerAdminRecord(updated);
+			try {
+				if (hasTimeChange) await persistCustomerBaseMutation(env, originalCustomer, validated);
+				if (hasUsageChange) await persistCustomerUsageMutation(env, originalCustomer, validated);
+			} catch (_) {
+				return createAdminApiResponse({ error: { code: 'partial_update', message: 'Package update was not completed; refresh customer data' } }, 503);
+			}
+			return createAdminApiResponse({ customer: toCustomerDetail(validated) }, 200);
+		}
+		if (route.route === 'quota') {
+			validateAdminBodyFields(body, ['quotaGiB', 'unlimitedTraffic', 'expectedRevision'], ['expectedRevision']);
+			const trafficPlan = parseAdminTrafficPlan(body), originalCustomer = await loadCustomerById(env, route.customerId);
+			if (!originalCustomer) return createAdminApiResponse({ error: { code: 'not_found', message: 'Customer not found' } }, 404);
+			validateExpectedRevision(body.expectedRevision, originalCustomer.schemaVersion === 4 ? originalCustomer.usageRevision : originalCustomer.revision);
+			const customer = promoteMembershipCustomer(originalCustomer);
+			if (customer.state !== 'active') throw createAdminCustomerError('pending_customer');
+			const withPlan = buildCustomerTrafficPlan(customer, trafficPlan);
+			const updated = validateCustomerAdminRecord({ ...withPlan, usageUpdatedAt: nextCustomerUsageUpdatedAt(customer), usageRevision: nextCustomerUsageRevision(customer) });
+			await persistCustomerUsageMutation(env, originalCustomer, updated);
+			return createAdminApiResponse({ customer: toCustomerDetail(updated) }, 200);
+		}
+
+		if (route.route === 'add-quota') {
+			validateAdminBodyFields(body, ['quotaGiB', 'expectedRevision'], ['quotaGiB', 'expectedRevision']);
+			const additionalBytes = validateAdminQuotaGiB(body.quotaGiB), originalCustomer = await loadCustomerById(env, route.customerId);
+			if (!originalCustomer) return createAdminApiResponse({ error: { code: 'not_found', message: 'Customer not found' } }, 404);
+			validateExpectedRevision(body.expectedRevision, originalCustomer.schemaVersion === 4 ? originalCustomer.usageRevision : originalCustomer.revision);
+			const customer = promoteMembershipCustomer(originalCustomer);
+			if (customer.state !== 'active') throw createAdminCustomerError('pending_customer');
+			const withQuota = addCustomerTrafficQuota(customer, additionalBytes);
+			const updated = validateCustomerAdminRecord({ ...withQuota, usageUpdatedAt: nextCustomerUsageUpdatedAt(customer), usageRevision: nextCustomerUsageRevision(customer) });
+			await persistCustomerUsageMutation(env, originalCustomer, updated);
+			return createAdminApiResponse({ customer: toCustomerDetail(updated) }, 200);
+		}
+
+		if (route.route === 'set-used-traffic') {
+			validateAdminBodyFields(body, ['expectedUsageRevision', 'usedGiB'], ['expectedUsageRevision', 'usedGiB']);
+			const usedBytes = validateAdminUsedGiB(body.usedGiB), originalCustomer = await loadCustomerById(env, route.customerId);
+			if (!originalCustomer) return createAdminApiResponse({ error: { code: 'not_found', message: 'Customer not found' } }, 404);
+			validateExpectedRevision(body.expectedUsageRevision, originalCustomer.schemaVersion === 4 ? originalCustomer.usageRevision : originalCustomer.revision);
+			const customer = promoteMembershipCustomer(originalCustomer);
+			if (customer.state !== 'active') throw createAdminCustomerError('pending_customer');
+			const corrected = setCustomerSettledUsage(customer, usedBytes, nextCustomerUsageUpdatedAt(customer));
+			const updated = validateCustomerAdminRecord({ ...corrected, usageRevision: nextCustomerUsageRevision(customer) });
+			await persistCustomerUsageMutation(env, originalCustomer, updated);
+			return createAdminApiResponse({ customer: toCustomerDetail(updated) }, 200);
+		}
+
+		if (route.route === 'reset-usage') {
+			validateAdminBodyFields(body, ['confirm', 'expectedRevision'], ['confirm', 'expectedRevision']);
+			if (body.confirm !== true) throw createAdminCustomerError('invalid_input');
+			const originalCustomer = await loadCustomerById(env, route.customerId);
+			if (!originalCustomer) return createAdminApiResponse({ error: { code: 'not_found', message: 'Customer not found' } }, 404);
+			validateExpectedRevision(body.expectedRevision, originalCustomer.schemaVersion === 4 ? originalCustomer.usageRevision : originalCustomer.revision);
+			const customer = promoteMembershipCustomer(originalCustomer);
+			if (customer.state !== 'active') throw createAdminCustomerError('pending_customer');
+			const usageReset = resetCustomerSettledUsage(customer, nextCustomerUsageUpdatedAt(customer));
+			const updated = validateCustomerAdminRecord({ ...usageReset, usageRevision: nextCustomerUsageRevision(customer) });
+			await persistCustomerUsageMutation(env, originalCustomer, updated);
 			return createAdminApiResponse({ customer: toCustomerDetail(updated) }, 200);
 		}
 	} catch (error) {
 		if (error?.code === 'invalid_input') return createAdminApiResponse({ error: { code: 'invalid_request', message: 'Invalid request' } }, 400);
 		if (error?.code === 'pending_customer') return createAdminApiResponse({ error: { code: 'customer_pending', message: 'Customer is pending activation' } }, 409);
+		if (error?.code === 'revision_conflict') return createAdminApiResponse({ error: { code: 'revision_conflict', message: 'Customer record revision has changed' } }, 409);
+		if (error?.code === 'idempotency_conflict') return createAdminApiResponse({ error: { code: 'idempotency_conflict', message: 'Idempotency key was already used for a different request' } }, 409);
+		if (error?.code === 'quota_unlimited') return createAdminApiResponse({ error: { code: 'quota_unlimited', message: 'Unlimited traffic customer has no finite quota to increase' } }, 409);
+		if (error?.code === 'partial_update') return createAdminApiResponse({ error: { code: 'partial_update', message: 'Package update was not completed; refresh customer data' } }, 503);
 		if (error?.code === 'migration_required') return createAdminApiResponse({ error: { code: 'migration_required', message: 'Customer record requires migration' } }, 409);
 		return createAdminApiResponse({ error: { code: 'service_unavailable', message: 'Membership customer service is temporarily unavailable' } }, 503);
 	}
@@ -632,11 +1324,158 @@ function createSubscriptionErrorResponse(status, message) {
 	});
 }
 
+function encodeUtf8Base64(value) {
+	const bytes = new TextEncoder().encode(String(value));
+	let binary = '';
+	const chunkSize = 0x8000;
+	for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+		binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+	}
+	return btoa(binary);
+}
+
+function resolveCustomerSubscriptionFormat(url, userAgent) {
+	const explicitFormats = url.searchParams.getAll('format');
+	if (explicitFormats.length > 1) return { error: true };
+	if (explicitFormats.length === 1) {
+		const explicitFormat = explicitFormats[0].trim().toLowerCase();
+		if (!['raw', 'base64', 'clash'].includes(explicitFormat)) return { error: true };
+		return { format: explicitFormat };
+	}
+
+	const ua = String(userAgent || '').toLowerCase();
+	if (url.searchParams.has('b64') || url.searchParams.has('base64')) return { format: 'base64' };
+	if (url.searchParams.has('clash')) return { format: 'clash' };
+	if (ua.includes('karing')) return { format: 'base64' };
+	if (ua.includes('clash') || ua.includes('mihomo') || ua.includes('clash verge') || ua.includes('clash-verge')) return { format: 'clash' };
+	if (url.searchParams.has('sb') || url.searchParams.has('singbox') || ua.includes('singbox') || ua.includes('sing-box')) return { unsupported: 'singbox' };
+	if (url.searchParams.has('surge') || url.searchParams.has('quanx') || url.searchParams.has('loon') || ua.includes('surge') || ua.includes('quantumult') || ua.includes('loon')) return { unsupported: 'other' };
+	return { format: ua.includes('mozilla') ? 'raw' : 'base64' };
+}
+
+function decodeUrlComponentSafely(value) {
+	try {
+		return decodeURIComponent(value);
+	} catch (_) {
+		return value;
+	}
+}
+
+function getSearchParamCaseInsensitive(searchParams, name) {
+	const normalizedName = name.toLowerCase();
+	for (const [key, value] of searchParams) {
+		if (key.toLowerCase() === normalizedName) return value;
+	}
+	return '';
+}
+
+function parseCustomerVlessNode(link, customerUuid) {
+	const normalizedCustomerUuid = normalizeMembershipUuid(customerUuid);
+	if (typeof link !== 'string' || !normalizedCustomerUuid) return null;
+	try {
+		const rawLink = link.trim();
+		if (!/^vless:\/\//i.test(rawLink) || /[\u0000-\u001f\u007f-\u009f]/.test(rawLink)) return null;
+		const parsedUrl = new URL(rawLink);
+		const transportTypes = parsedUrl.searchParams.getAll('type');
+		const port = Number(parsedUrl.port);
+		const username = decodeUrlComponentSafely(parsedUrl.username);
+		if (
+			parsedUrl.protocol.toLowerCase() !== 'vless:' ||
+			!parsedUrl.hostname ||
+			parsedUrl.password ||
+			transportTypes.length !== 1 ||
+			transportTypes[0].toLowerCase() !== 'ws' ||
+			normalizeMembershipUuid(username) !== normalizedCustomerUuid ||
+			!Number.isSafeInteger(port) ||
+			port < 1 ||
+			port > 65535
+		) return null;
+
+		const server = parsedUrl.hostname.replace(/^\[|\]$/g, '');
+		const wsHost = getSearchParamCaseInsensitive(parsedUrl.searchParams, 'host') || server;
+		const security = getSearchParamCaseInsensitive(parsedUrl.searchParams, 'security').toLowerCase();
+		const tls = security === 'tls' || security === 'reality';
+		const servername = getSearchParamCaseInsensitive(parsedUrl.searchParams, 'sni') || wsHost || server;
+		const path = getSearchParamCaseInsensitive(parsedUrl.searchParams, 'path') || '/';
+		const insecure = getSearchParamCaseInsensitive(parsedUrl.searchParams, 'allowinsecure') || getSearchParamCaseInsensitive(parsedUrl.searchParams, 'insecure');
+		const skipCertVerify = ['1', 'true', 'yes'].includes(insecure.toLowerCase());
+		const fragmentName = decodeUrlComponentSafely(parsedUrl.hash.slice(1)).trim();
+		return {
+			link: parsedUrl.toString(),
+			name: fragmentName,
+			server,
+			port,
+			uuid: normalizedCustomerUuid,
+			tls,
+			servername,
+			skipCertVerify,
+			path,
+			host: wsHost,
+		};
+	} catch (_) {
+		return null;
+	}
+}
+
+function quoteYamlString(value) {
+	return JSON.stringify(String(value)).replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
+}
+
+function buildCustomerClashMetaYaml(content, customerUuid, skipCertVerifyDefault = false) {
+	const nodes = String(content).split(/\r?\n/).map(line => parseCustomerVlessNode(line, customerUuid)).filter(Boolean);
+	if (nodes.length === 0) throw new Error('Empty customer subscription');
+
+	const usedNames = new Set(['PROXY']);
+	for (let index = 0; index < nodes.length; index++) {
+		const baseName = nodes[index].name || `VLESS ${index + 1}`;
+		let uniqueName = baseName;
+		for (let suffix = 2; usedNames.has(uniqueName); suffix++) uniqueName = `${baseName} (${suffix})`;
+		usedNames.add(uniqueName);
+		nodes[index].name = uniqueName;
+	}
+
+	const lines = [
+		'mixed-port: 7890',
+		'allow-lan: true',
+		'mode: rule',
+		'log-level: info',
+		'proxies:',
+	];
+	for (const node of nodes) {
+		lines.push(
+			`  - name: ${quoteYamlString(node.name)}`,
+			'    type: vless',
+			`    server: ${quoteYamlString(node.server)}`,
+			`    port: ${node.port}`,
+			`    uuid: ${quoteYamlString(node.uuid)}`,
+			'    network: ws',
+			`    tls: ${node.tls ? 'true' : 'false'}`,
+			'    udp: true',
+			`    servername: ${quoteYamlString(node.servername)}`,
+			`    skip-cert-verify: ${node.skipCertVerify || skipCertVerifyDefault === true ? 'true' : 'false'}`,
+			'    ws-opts:',
+			`      path: ${quoteYamlString(node.path)}`,
+			'      headers:',
+			`        Host: ${quoteYamlString(node.host)}`,
+		);
+	}
+	lines.push(
+		'proxy-groups:',
+		'  - name: "PROXY"',
+		'    type: select',
+		'    proxies:',
+		...nodes.map(node => `      - ${quoteYamlString(node.name)}`),
+		'rules:',
+		'  - MATCH,PROXY',
+	);
+	return lines.join('\n') + '\n';
+}
+
 function normalizeCustomerVlessSubscription(content, customerUuid) {
 	const normalizedCustomerUuid = normalizeMembershipUuid(customerUuid);
 	if (typeof content !== 'string' || !normalizedCustomerUuid) throw new Error('Invalid customer subscription content');
 	const normalizedLines = content.split(/\r?\n/).flatMap(line => {
-		if (!/^\s*vless:\/\//i.test(line)) return /^\s*[a-z][a-z0-9+.-]*:\/\//i.test(line) ? [] : [line];
+		if (!/^\s*vless:\/\//i.test(line)) return [];
 		try {
 			const rawLink = line.trim();
 			if (/[\u0000-\u001f\u007f-\u009f]/.test(rawLink)) return [];
@@ -660,22 +1499,16 @@ function normalizeCustomerVlessSubscription(content, customerUuid) {
 			if (!originalUsername || !originalUsername.trim() || /[\u0000-\u001f\u007f-\u009f]/.test(originalUsername)) return [];
 			parsedUrl.username = normalizedCustomerUuid;
 			const normalizedLink = parsedUrl.toString();
-			const verifiedUrl = new URL(normalizedLink);
-			if (normalizeMembershipUuid(decodeURIComponent(verifiedUrl.username)) !== normalizedCustomerUuid || verifiedUrl.searchParams.getAll('type').length !== 1 || verifiedUrl.searchParams.get('type')?.toLowerCase() !== 'ws') throw new Error('Invalid customer VLESS link');
-			return [normalizedLink];
+			const verifiedNode = parseCustomerVlessNode(normalizedLink, normalizedCustomerUuid);
+			if (!verifiedNode) throw new Error('Invalid customer VLESS link');
+			return [verifiedNode.link];
 		} catch (_) {
 			return [];
 		}
 	});
 	const normalizedContent = normalizedLines.join('\n');
 	for (const line of normalizedContent.split(/\r?\n/)) {
-		if (!/^\s*vless:\/\//i.test(line)) continue;
-		try {
-			const parsedUrl = new URL(line.trim());
-			if (parsedUrl.protocol.toLowerCase() !== 'vless:' || normalizeMembershipUuid(decodeURIComponent(parsedUrl.username)) !== normalizedCustomerUuid || parsedUrl.searchParams.getAll('type').length !== 1 || parsedUrl.searchParams.get('type')?.toLowerCase() !== 'ws') throw new Error('Invalid customer VLESS link');
-		} catch (_) {
-			throw new Error('Invalid customer subscription content');
-		}
+		if (!parseCustomerVlessNode(line, normalizedCustomerUuid)) throw new Error('Invalid customer subscription content');
 	}
 	return normalizedContent;
 }
@@ -684,13 +1517,7 @@ function hasValidCustomerSubscriptionNode(content, customerUuid) {
 	if (typeof content !== 'string') return false;
 	return content.split(/\r?\n/).some(line => {
 		const trimmedLine = line.trim();
-		if (!trimmedLine || trimmedLine.startsWith('#') || trimmedLine.startsWith(';') || /[\u0000-\u001f\u007f-\u009f]/.test(trimmedLine)) return false;
-		try {
-			const parsedUrl = new URL(trimmedLine);
-			return parsedUrl.protocol.toLowerCase() === 'vless:' && !!parsedUrl.hostname && !parsedUrl.password && normalizeMembershipUuid(decodeURIComponent(parsedUrl.username)) === customerUuid && parsedUrl.searchParams.getAll('type').length === 1 && parsedUrl.searchParams.get('type')?.toLowerCase() === 'ws';
-		} catch (_) {
-			return false;
-		}
+		return !!trimmedLine && !!parseCustomerVlessNode(trimmedLine, customerUuid);
 	});
 }
 ///////////////////////////////////////////////////////查杀特征码///////////////////////////////////////////////
@@ -778,7 +1605,7 @@ export default {
 					return new Response('重定向中...', { status: 302, headers: { 'Location': '/login' } });
 				}
 				if (会员管理路由.route === 'members_page') return renderAdminMembersPage();
-				if (会员管理路由.route) return await handleAdminCustomerApi(request, env, 会员管理路由, { host, userID });
+				if (会员管理路由.route) return await handleAdminCustomerApi(request, env, 会员管理路由, { host, userID, adminPassword: 管理员密码, encryptionKey: 加密秘钥 });
 				if (会员管理路由.isAdminApi) return createAdminApiResponse({ error: { code: 'not_found', message: 'Admin API route not found' } }, 404);
 			}
 			if (env.KV && typeof env.KV.get === 'function') {
@@ -1028,6 +1855,7 @@ export default {
 						} catch (error) {
 							if (error?.code === 'membership_disabled') return createSubscriptionErrorResponse(403, '订阅已停用');
 							if (error?.code === 'membership_expired') return createSubscriptionErrorResponse(410, '订阅已到期');
+							if (error?.code === 'membership_quota_exceeded') return createSubscriptionErrorResponse(403, '订阅流量额度已用尽');
 							return createSubscriptionErrorResponse(503, '会员服务暂时不可用');
 						}
 						if (customer) {
@@ -1041,6 +1869,10 @@ export default {
 					}
 					if (订阅身份) {
 						const 有效订阅UUID = 订阅身份.uuid;
+						const 客户订阅格式 = 订阅身份.kind === 'customer' ? resolveCustomerSubscriptionFormat(url, UA) : null;
+						if (客户订阅格式?.error) return createSubscriptionErrorResponse(400, '不支持的订阅格式');
+						if (客户订阅格式?.unsupported === 'singbox') return createSubscriptionErrorResponse(501, '会员订阅暂不支持 Sing-box 格式');
+						if (客户订阅格式?.unsupported) return createSubscriptionErrorResponse(501, '会员订阅暂不支持该格式');
 						try {
 						config_JSON = 订阅身份.kind === 'customer'
 							? await 读取config_JSON(env, host, 有效订阅UUID, UA, false, userID)
@@ -1061,7 +1893,9 @@ export default {
 							responseHeaders["Subscription-Userinfo"] = `upload=${pagesSum}; download=${workersSum}; total=${total}; expire=4102329600`; // 2099-12-31 到期时间
 						}
 						const isSubConverterRequest = url.searchParams.has('b64') || url.searchParams.has('base64') || request.headers.get('subconverter-request') || request.headers.get('subconverter-version') || ua.includes('subconverter') || ua.includes(('CF-Workers-SUB').toLowerCase()) || 作为优选订阅生成器;
-						const 订阅类型 = isSubConverterRequest
+						const 订阅类型 = 订阅身份.kind === 'customer'
+							? 'mixed'
+							: isSubConverterRequest
 							? 'mixed'
 							: url.searchParams.has('target')
 								? url.searchParams.get('target')
@@ -1076,10 +1910,11 @@ export default {
 											: url.searchParams.has('loon') || ua.includes('loon')
 												? 'loon'
 												: 'mixed';
-						if (订阅身份.kind === 'customer' && 订阅类型 !== 'mixed') return createSubscriptionErrorResponse(501, '会员订阅暂不支持外部格式转换，请使用 mixed 或 Base64 格式');
 
 						if (!ua.includes('mozilla')) responseHeaders["Content-Disposition"] = `attachment; filename*=utf-8''${encodeURIComponent(config_JSON.优选订阅生成.SUBNAME)}`;
-						const 协议类型 = ((url.searchParams.has('surge') || ua.includes('surge')) && config_JSON.协议类型 !== 'ss') ? 'tro' + 'jan' : config_JSON.协议类型;
+						const 协议类型 = 订阅身份.kind === 'customer'
+							? 'vless'
+							: ((url.searchParams.has('surge') || ua.includes('surge')) && config_JSON.协议类型 !== 'ss') ? 'tro' + 'jan' : config_JSON.协议类型;
 						let 订阅内容 = '';
 						if (订阅类型 === 'mixed') {
 							const TLS分片参数 = config_JSON.TLS分片 == 'Shadowrocket' ? `&fragment=${encodeURIComponent('1,40-60,30-50,tlshello')}` : config_JSON.TLS分片 == 'Happ' ? `&fragment=${encodeURIComponent('3,1,tlshello')}` : '';
@@ -1131,8 +1966,10 @@ export default {
 								其他节点LINK += 优选生成器其他节点;
 							}
 							const ECHLINK参数 = config_JSON.ECH ? `&ech=${encodeURIComponent((config_JSON.ECHConfig.SNI ? config_JSON.ECHConfig.SNI + '+' : '') + config_JSON.ECHConfig.DNS)}` : '';
-							const isLoonOrSurge = ua.includes('loon') || ua.includes('surge');
-							const { type: 传输协议, 路径字段名, 域名字段名 } = 获取传输协议配置(config_JSON);
+							const isLoonOrSurge = 订阅身份.kind !== 'customer' && (ua.includes('loon') || ua.includes('surge'));
+							const { type: 传输协议, 路径字段名, 域名字段名 } = 订阅身份.kind === 'customer'
+								? { type: 'ws', 路径字段名: 'path', 域名字段名: 'host' }
+								: 获取传输协议配置(config_JSON);
 							订阅内容 = 其他节点LINK + 完整优选IP.map(原始地址 => {
 								// 统一正则: 匹配 域名/IPv4/IPv6地址 + 可选端口 + 可选备注
 								// 示例:
@@ -1218,16 +2055,21 @@ export default {
 						if (订阅身份.kind === 'customer') {
 							订阅内容 = normalizeCustomerVlessSubscription(订阅内容, 有效订阅UUID);
 							if (!hasValidCustomerSubscriptionNode(订阅内容, 有效订阅UUID)) throw new Error('Empty customer subscription');
-						}
-
-						if (订阅类型 === 'mixed' && (!ua.includes('mozilla') || url.searchParams.has('b64') || url.searchParams.has('base64'))) 订阅内容 = btoa(订阅内容);
-
-						if (订阅类型 === 'singbox') {
-							订阅内容 = await Singbox订阅配置文件热补丁(订阅内容, config_JSON);
-							responseHeaders["content-type"] = 'application/json; charset=utf-8';
-						} else if (订阅类型 === 'clash') {
-							订阅内容 = Clash订阅配置文件热补丁(订阅内容, config_JSON);
-							responseHeaders["content-type"] = 'application/x-yaml; charset=utf-8';
+							if (客户订阅格式.format === 'base64') {
+								订阅内容 = encodeUtf8Base64(订阅内容);
+							} else if (客户订阅格式.format === 'clash') {
+								订阅内容 = buildCustomerClashMetaYaml(订阅内容, 有效订阅UUID, config_JSON.跳过证书验证);
+								responseHeaders["content-type"] = 'text/yaml; charset=utf-8';
+							}
+						} else {
+							if (订阅类型 === 'mixed' && (!ua.includes('mozilla') || url.searchParams.has('b64') || url.searchParams.has('base64'))) 订阅内容 = btoa(订阅内容);
+							if (订阅类型 === 'singbox') {
+								订阅内容 = await Singbox订阅配置文件热补丁(订阅内容, config_JSON);
+								responseHeaders["content-type"] = 'application/json; charset=utf-8';
+							} else if (订阅类型 === 'clash') {
+								订阅内容 = Clash订阅配置文件热补丁(订阅内容, config_JSON);
+								responseHeaders["content-type"] = 'application/x-yaml; charset=utf-8';
+							}
 						}
 						return new Response(订阅内容, { status: 200, headers: responseHeaders });
 						} catch (error) {
@@ -1265,6 +2107,16 @@ export default {
 			return 反代响应;
 		} catch (error) { }
 		return new Response(await nginx(), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
+	},
+	async scheduled(event, env, ctx) {
+		const summary = await runMembershipUsageSettlement({ env });
+		if (summary.ok) {
+			console.log(`[membership-settlement] ${JSON.stringify({ today: summary.today, days: summary.days, skippedDays: summary.skippedDays, sqlQueries: summary.sqlQueries, customers: summary.customers, settledCustomers: summary.settledCustomers, skippedCustomers: summary.skippedCustomers, failedCustomers: summary.failedCustomers, kvWrites: summary.kvWrites, cursor: summary.cursor })}`);
+		} else if (summary.skipped) {
+			console.log(`[membership-settlement] skipped (${summary.skipped})`);
+		} else {
+			console.warn(`[membership-settlement] failed: ${summary.error || 'unknown'}`);
+		}
 	}
 };
 ///////////////////////////////////////////////////////////////////////叉HTTP传输数据///////////////////////////////////////////////
@@ -2034,8 +2886,7 @@ function 解码WS早期数据(header, token, membershipMode = 'legacy') {
 async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}, env = {}) {
 	const WS套接字对 = new WebSocketPair();
 	const [clientSock, serverSock] = Object.values(WS套接字对);
-	try { (/** @type {any} */ (serverSock)).accept({ allowHalfOpen: true }) }
-	catch (_) { serverSock.accept() }
+	serverSock.accept();
 	serverSock.binaryType = 'arraybuffer';
 	let remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null, downlinkDrain: Promise.resolve() };
 	const 失效远端连接 = () => 失效TCP连接世代(remoteConnWrapper);
@@ -2050,6 +2901,7 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}, env 
 	let WS显式队列字节 = 0, WS显式队列条目 = 0;
 	let 判断协议类型 = null, 当前写入Socket = null, 远端写入器 = null;
 	let VLESS连接身份 = null;
+	let usageTracker = null;
 	let ss上下文 = null, ss初始化任务 = null;
 	let WS本地测速模式 = false, WS本地测速回包Socket = null;
 	let WS本地测速请求缓存 = new Uint8Array(0);
@@ -2391,7 +3243,7 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}, env 
 			await 处理WS本地测速数据(chunk);
 			return;
 		}
-		if (await 写入远端(chunk)) return;
+		if (await 写入远端(chunk)) { if (usageTracker) await usageTracker.add(0, chunk?.byteLength || 0); return; }
 
 		if (判断协议类型 === null) {
 			if (url.searchParams.get('enc')) 判断协议类型 = 'ss';
@@ -2408,7 +3260,7 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}, env 
 			await 处理SS数据(chunk);
 			return;
 		}
-		if (await 写入远端(chunk)) return;
+		if (await 写入远端(chunk)) { if (usageTracker) await usageTracker.add(0, chunk?.byteLength || 0); return; }
 		if (判断协议类型 === '木马') {
 			const 解析结果 = 解析木马请求(chunk, yourUUID);
 			if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid trojan request');
@@ -2433,6 +3285,7 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}, env 
 			const 候选UUID = 提取魏烈思UUID(bytes);
 			VLESS连接身份 = await authenticateVlessUuid(env, 候选UUID, yourUUID);
 			if (!VLESS连接身份) throw new Error('VLESS authentication failed');
+			usageTracker = createMembershipUsageTracker(VLESS连接身份.customerId, env);
 			const 解析结果 = 解析魏烈思请求(bytes, VLESS连接身份.uuid);
 			if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid 魏烈思 request');
 			const { port, hostname, version, isUDP, rawClientData } = 解析结果;
@@ -2448,9 +3301,9 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}, env 
 			const rawData = rawClientData;
 			if (isDnsQuery) {
 				if (判断是否是木马) return 转发木马UDP数据(rawData, serverSock, 木马UDP上下文, request);
-				return forwardataudp(rawData, serverSock, respHeader, request);
+				return forwardataudp(rawData, serverSock, respHeader, request, null, usageTracker);
 			}
-			await forwardataTCP(hostname, port, rawData, serverSock, respHeader, remoteConnWrapper, yourUUID, request, 反代上下文);
+			await forwardataTCP(hostname, port, rawData, serverSock, respHeader, remoteConnWrapper, yourUUID, request, 反代上下文, false, null, false, usageTracker);
 		}
 	};
 
@@ -2471,6 +3324,7 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}, env 
 		失效远端连接();
 		try { 木马UDP上下文.反代Socket?.close() } catch (e) { }
 		closeSocketQuietly(serverSock);
+	void usageTracker?.close()?.catch(() => { });
 	};
 
 	const 追加WS显式传输任务 = (任务) => {
@@ -2503,10 +3357,14 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}, env 
 		WS显式传输停止接收 = true;
 		追加WS显式传输任务(async () => {
 			if (WS显式传输失败) return;
-			await 上行写入队列.等待空();
+			await Promise.race([
+				上行写入队列.等待空(),
+				new Promise(resolve => setTimeout(resolve, 1000)),
+			]);
 			释放远端写入器();
 			失效远端连接();
 			try { 木马UDP上下文.反代Socket?.close() } catch (e) { }
+			void usageTracker?.close()?.catch(() => { });
 		});
 	};
 
@@ -2922,7 +3780,7 @@ async function SSAEAD解密(cryptoKey, nonceCounter, ciphertext) {
 	return new Uint8Array(pt);
 }
 
-async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnWrapper, yourUUID, request = null, 反代上下文 = {}, 允许木马反代 = false, 木马反代首包数据 = null, 仅建立连接 = false) {
+async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnWrapper, yourUUID, request = null, 反代上下文 = {}, 允许木马反代 = false, 木马反代首包数据 = null, 仅建立连接 = false, usageTracker = null) {
 	const ctx反代IP = 反代上下文.反代IP || '';
 	const ctx代理类型 = 反代上下文.代理类型 !== undefined ? 反代上下文.代理类型 : null;
 	const ctx代理全局 = 反代上下文.代理全局 !== undefined ? 反代上下文.代理全局 : false;
@@ -2960,7 +3818,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 		}
 		remoteConnWrapper.socket = socket;
 		if (仅建立连接) return socket;
-		connectStreams(socket, ws, 取出响应头, retryFunc, 连接仍有效, remoteConnWrapper).catch(err => {
+		connectStreams(socket, ws, 取出响应头, retryFunc, 连接仍有效, remoteConnWrapper, usageTracker).catch(err => {
 			if (!连接仍有效()) return;
 			log(`[TCP下行] 处理失败: ${err?.message || err}`);
 			try { socket?.close?.() } catch (e) { }
@@ -2987,10 +3845,10 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 		}
 	}
 
-	async function 写入首包(remoteSock, data) {
+	async function 写入首包(remoteSock, data, tracker = usageTracker) {
 		if (有效数据长度(data) <= 0) return;
 		const writer = remoteSock.writable.getWriter();
-		try { await writer.write(数据转Uint8Array(data)) }
+		try { await writer.write(数据转Uint8Array(data)); await tracker?.add(数据转Uint8Array(data).byteLength, 0) }
 		finally { try { writer.releaseLock() } catch (e) { } }
 	}
 
@@ -3220,7 +4078,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	}
 }
 
-async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封装器 = null) {
+async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封装器 = null, usageTracker = null) {
 	const 请求数据 = 数据转Uint8Array(udpChunk);
 	const 请求字节数 = 请求数据.byteLength;
 	log(`[UDP转发] 收到 DNS 请求: ${请求字节数}B -> 8.8.4.4:53`);
@@ -3230,6 +4088,7 @@ async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封
 		let 魏烈思Header = respHeader;
 		const writer = tcpSocket.writable.getWriter();
 		await writer.write(请求数据);
+		await usageTracker?.add(请求数据.byteLength, 0);
 		log(`[UDP转发] DNS 请求已写入上游: ${请求字节数}B`);
 		writer.releaseLock();
 		await tcpSocket.readable.pipeTo(new WritableStream({
@@ -3248,9 +4107,11 @@ async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封
 						response.set(魏烈思Header, 0);
 						response.set(转发响应, 魏烈思Header.length);
 						await WebSocket发送并等待(webSocket, response.buffer);
+						await usageTracker?.add(0, fragment?.byteLength || 0);
 						魏烈思Header = null;
 					} else {
 						await WebSocket发送并等待(webSocket, 转发响应);
+						await usageTracker?.add(0, fragment?.byteLength || 0);
 					}
 				}
 			},
@@ -3261,11 +4122,12 @@ async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封
 }
 
 function closeSocketQuietly(socket) {
+	if (!socket) return;
 	try {
-		if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CLOSING) {
-			socket.close();
-		}
-	} catch (error) { }
+		socket.close();
+	} catch (error) {
+		log(`[WS关闭] closeSocketQuietly 关闭失败: ${error?.message || error}`);
+	}
 }
 
 function formatIdentifier(arr, offset = 0) {
@@ -3779,7 +4641,7 @@ function 创建下行Grain发送器(webSocket, headerData = null, isActive = nul
 	};
 }
 
-async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, isCurrentSocket = null, remoteConnWrapper = null) {
+async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, isCurrentSocket = null, remoteConnWrapper = null, usageTracker = null) {
 	let header = headerData, hasData = false, reader, useBYOB = false, readError = null;
 	const BYOB单次读取上限 = 64 * 1024;
 	const 当前连接仍有效 = () => !isCurrentSocket || isCurrentSocket();
@@ -3803,8 +4665,10 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, is
 				if (value.byteLength >= 下行Grain包字节) {
 					await 下行发送器.flush();
 					await 下行发送器.直接发送(value);
+					await usageTracker?.add(0, value.byteLength);
 				} else {
 					await 下行发送器.发送(value);
+					await usageTracker?.add(0, value.byteLength);
 				}
 			}
 		} else {
@@ -3818,9 +4682,11 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, is
 				if (value.byteLength >= 下行Grain包字节) {
 					await 下行发送器.flush();
 					await 下行发送器.直接发送(value);
+					await usageTracker?.add(0, value.byteLength);
 					readBuffer = new ArrayBuffer(BYOB单次读取上限);
 				} else {
 					await 下行发送器.发送(value.slice());
+					await usageTracker?.add(0, value.byteLength);
 					readBuffer = value.buffer.byteLength >= BYOB单次读取上限 ? value.buffer : new ArrayBuffer(BYOB单次读取上限);
 				}
 			}

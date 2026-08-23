@@ -1,0 +1,681 @@
+// Membership usage settlement — daily batch from Cloudflare Workers Analytics Engine (SQL API).
+//
+// Business rules:
+// - Customer plans are measured in days and traffic accounting does not need to be exact.
+//   Over-quota customers are rejected by the existing auth path on new connections;
+//   established connections are not torn down immediately.
+// - One SQL query per completed natural day (GROUP BY index1/customerId). There are no
+//   per-customer Analytics Engine requests.
+// - A global day cursor (`settlement:global:lastCompletedDay`) advances only after a day's
+//   SQL query succeeds AND no customer hit a temporary KV error (usage record get/put
+//   failure). A day with such errors still writes its successful customers (each with the
+//   day-boundary idempotency marker) but does not advance the cursor, so the next run
+//   retries only the failed customers. A failed SQL query writes no customer KV and stops
+//   the run.
+// - Missed runs are backfilled sequentially for at most `maxBackfillDays` (default 3).
+// - Per-customer idempotency: `usageSettledThrough` stores the UTC ms of the settled local
+//   day boundary. A customer whose marker is already at/after the day boundary is skipped,
+//   so re-running the same day never double-accumulates.
+// - Per customer with traffic: exactly 1 KV get + 1 KV put. Missing/corrupt records are
+//   skipped and reported; the day still completes.
+//
+// This module is deliberately self-contained (no imports from _worker.js) so it can be
+// exercised by the local test suite with injected fetch/KV mocks.
+
+const MEMBERSHIP_USAGE_KEY_PREFIX = 'membership:usage:';
+const MEMBERSHIP_USAGE_RECORD_TYPE = 'usage-v1';
+const MEMBERSHIP_USAGE_POLICY_VERSION = 'usage-v1';
+const MEMBERSHIP_USAGE_TRANSPORT = 'vless-ws';
+const MEMBERSHIP_SETTLEMENT_CURSOR_KEY = 'settlement:global:lastCompletedDay';
+
+const MEMBERSHIP_USAGE_FIELDS = [
+	'schemaVersion',
+	'kind',
+	'customerId',
+	'quotaBytes',
+	'settledUsedBytes',
+	'quotaExceeded',
+	'usageUpdatedAt',
+	'usageSettledThrough',
+	'unlimitedTraffic',
+	'revision',
+];
+
+const CUSTOMER_ID_PATTERN = /^cus_[A-Za-z0-9_-]{16,128}$/;
+const DATASET_PATTERN = /^[A-Za-z0-9_]{1,128}$/;
+const ACCOUNT_ID_PATTERN = /^[0-9a-f]{32}$/;
+const DAY_KEY_PATTERN = /^(\d{4})-(\d{2})-(\d{2})$/;
+const DEFAULT_TIMEZONE = 'Asia/Shanghai';
+
+function sqlError(code, message) {
+	const error = new Error(message);
+	error.code = code;
+	return error;
+}
+
+function positiveInteger(value, fallback, max) {
+	const parsed = Number(value);
+	return Number.isInteger(parsed) && parsed > 0 && parsed <= max ? parsed : fallback;
+}
+
+function getMembershipSettlementConfig(env = {}) {
+	const enabled = ['1', 'true', 'yes'].includes(String(env?.MEMBERSHIP_USAGE_SETTLEMENT_ENABLED ?? '').trim().toLowerCase());
+	return {
+		enabled,
+		accountId: String(env?.MEMBERSHIP_USAGE_ACCOUNT_ID ?? '').trim(),
+		apiToken: String(env?.MEMBERSHIP_USAGE_API_TOKEN ?? ''),
+		dataset: String(env?.MEMBERSHIP_USAGE_DATASET ?? '').trim(),
+		timezone: String(env?.MEMBERSHIP_USAGE_SETTLEMENT_TIMEZONE ?? '').trim() || DEFAULT_TIMEZONE,
+		maxBackfillDays: positiveInteger(env?.MEMBERSHIP_USAGE_SETTLEMENT_MAX_BACKFILL_DAYS, 3, 7),
+		concurrency: positiveInteger(env?.MEMBERSHIP_USAGE_SETTLEMENT_CONCURRENCY, 8, 32),
+	};
+}
+
+function validateSettlementConfig(config) {
+	if (!config?.enabled) return { ok: false, reason: 'disabled' };
+	if (typeof config.accountId !== 'string' || !ACCOUNT_ID_PATTERN.test(config.accountId)) return { ok: false, reason: 'invalid_account_id' };
+	if (typeof config.apiToken !== 'string' || config.apiToken.length === 0) return { ok: false, reason: 'missing_api_token' };
+	if (typeof config.dataset !== 'string' || !DATASET_PATTERN.test(config.dataset)) return { ok: false, reason: 'invalid_dataset' };
+	try {
+		new Intl.DateTimeFormat('en-US', { timeZone: config.timezone });
+	} catch (_) {
+		return { ok: false, reason: 'invalid_timezone' };
+	}
+	return { ok: true };
+}
+
+function sqlEndpoint(accountId) {
+	return `https://api.cloudflare.com/client/v4/accounts/${accountId}/analytics_engine/sql`;
+}
+
+// ---------------------------------------------------------------- day math
+
+function parseDayKey(dayKey) {
+	const match = DAY_KEY_PATTERN.exec(dayKey);
+	if (!match) return null;
+	return { year: Number(match[1]), month: Number(match[2]), day: Number(match[3]) };
+}
+
+function formatDayKey(year, month, day) {
+	return `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+}
+
+function addDays(dayKey, delta) {
+	const parsed = parseDayKey(dayKey);
+	if (!parsed) throw sqlError('invalid_day', `Invalid day key: ${dayKey}`);
+	const date = new Date(Date.UTC(parsed.year, parsed.month - 1, parsed.day + delta));
+	return formatDayKey(date.getUTCFullYear(), date.getUTCMonth() + 1, date.getUTCDate());
+}
+
+function nextDayKey(dayKey) {
+	return addDays(dayKey, 1);
+}
+
+function dayPartsInTimeZone(nowMs, timeZone) {
+	const parts = new Intl.DateTimeFormat('en-US', {
+		timeZone,
+		hourCycle: 'h23',
+		year: 'numeric',
+		month: '2-digit',
+		day: '2-digit',
+		hour: '2-digit',
+		minute: '2-digit',
+		second: '2-digit',
+	}).formatToParts(nowMs);
+	const values = {};
+	for (const part of parts) {
+		if (part.type !== 'literal') values[part.type] = Number(part.value);
+	}
+	return values;
+}
+
+// Converts a wall-clock time in the given IANA timezone to UTC epoch ms.
+// Exact except for local times that fall inside a DST gap/overlap around the
+// conversion instant; day boundaries at midnight are unambiguous in all
+// commonly used zones (Asia/Shanghai has no DST at all).
+function zonedTimeToUtcMs(timeZone, year, month, day, hour = 0, minute = 0, second = 0) {
+	const naiveUtc = Date.UTC(year, month - 1, day, hour, minute, second);
+	const values = dayPartsInTimeZone(naiveUtc, timeZone);
+	const wallUtc = Date.UTC(values.year, values.month - 1, values.day, values.hour % 24, values.minute, values.second);
+	return naiveUtc - (wallUtc - naiveUtc);
+}
+
+function dayStartUtcMs(dayKey, timeZone) {
+	const parsed = parseDayKey(dayKey);
+	if (!parsed) throw sqlError('invalid_day', `Invalid day key: ${dayKey}`);
+	return zonedTimeToUtcMs(timeZone, parsed.year, parsed.month, parsed.day);
+}
+
+function dayEndUtcMs(dayKey, timeZone) {
+	return dayStartUtcMs(nextDayKey(dayKey), timeZone);
+}
+
+function localDayKey(nowMs, timeZone) {
+	const values = dayPartsInTimeZone(nowMs, timeZone);
+	return formatDayKey(values.year, values.month, values.day);
+}
+
+function calendarDaysBetween(startKey, endKey) {
+	const days = [];
+	let current = startKey;
+	let guard = 0;
+	while (current <= endKey && guard < 400) {
+		days.push(current);
+		current = nextDayKey(current);
+		guard++;
+	}
+	return days;
+}
+
+// Plans the completed days to settle. `todayKey` is the current local day; only
+// fully ended natural days (strictly before today) are ever processed.
+// Returns the ordered days to settle plus any days that were skipped because
+// they fell outside the backfill window.
+function planSettlementDays(cursorDay, todayKey, maxBackfillDays) {
+	const windowStart = addDays(todayKey, -maxBackfillDays);
+	const windowEnd = addDays(todayKey, -1);
+	if (cursorDay === null || cursorDay === undefined || cursorDay === '') cursorDay = null;
+	if (cursorDay !== null && !DAY_KEY_PATTERN.test(cursorDay)) {
+		throw sqlError('invalid_cursor', `Invalid settlement cursor: ${cursorDay}`);
+	}
+	let start = cursorDay === null ? windowStart : addDays(cursorDay, 1);
+	const skippedDays = [];
+	if (start < windowStart) {
+		skippedDays.push(...calendarDaysBetween(start, addDays(windowStart, -1)));
+		start = windowStart;
+	}
+	if (start > windowEnd) return { days: [], skippedDays };
+	return { days: calendarDaysBetween(start, windowEnd), skippedDays };
+}
+
+// ---------------------------------------------------------------- SQL API
+
+// One grouped query per completed natural day. Doubles written by the tracker:
+// [upload, download, sampleWeight, 1]. `_sample_interval` is the platform sampling
+// factor and `double3` is our own write-time sample weight; multiplying by both
+// restores the true byte volume (see the Analytics Engine SQL API docs).
+function buildMembershipUsageDayQuery({ dataset, recordType = MEMBERSHIP_USAGE_RECORD_TYPE, policyVersion = MEMBERSHIP_USAGE_POLICY_VERSION }, dayKey, timeZone) {
+	if (typeof dataset !== 'string' || !DATASET_PATTERN.test(dataset)) throw sqlError('invalid_dataset', 'Invalid Analytics Engine dataset name');
+	const fromMs = dayStartUtcMs(dayKey, timeZone);
+	const toMs = dayEndUtcMs(dayKey, timeZone);
+	const fromSec = Math.floor(fromMs / 1000);
+	const toSec = Math.floor(toMs / 1000);
+	return [
+		'SELECT',
+		'  index1 AS customerId,',
+		'  SUM(_sample_interval * double3 * double1) AS uploadBytes,',
+		'  SUM(_sample_interval * double3 * double2) AS downloadBytes,',
+		'  SUM(_sample_interval * double4) AS pointCount,',
+		'  COUNT() AS rowCount',
+		`FROM ${dataset}`,
+		`WHERE blob1 = '${recordType}'`,
+		`  AND blob2 = '${MEMBERSHIP_USAGE_TRANSPORT}'`,
+		`  AND blob4 = '${policyVersion}'`,
+		`  AND timestamp >= toDateTime(${fromSec})`,
+		`  AND timestamp < toDateTime(${toSec})`,
+		'GROUP BY index1',
+	].join('\n');
+}
+
+function extractApiErrorMessage(payload) {
+	if (!payload || typeof payload !== 'object') return null;
+	if (Array.isArray(payload.errors) && payload.errors.length) {
+		const first = payload.errors[0];
+		if (first && typeof first.message === 'string' && first.message) return first.message;
+	}
+	if (Array.isArray(payload.messages) && payload.messages.length) {
+		const first = payload.messages[0];
+		if (first && typeof first.message === 'string' && first.message) return first.message;
+	}
+	if (typeof payload.exception === 'string' && payload.exception) return payload.exception;
+	if (payload.data && typeof payload.data.exception === 'string' && payload.data.exception) return payload.data.exception;
+	return null;
+}
+
+const ROW_KEY_ALIASES = {
+	customerid: 'customerId',
+	customer_id: 'customerId',
+	uploadbytes: 'uploadBytes',
+	upload_bytes: 'uploadBytes',
+	downloadbytes: 'downloadBytes',
+	download_bytes: 'downloadBytes',
+	pointcount: 'pointCount',
+	point_count: 'pointCount',
+	rowcount: 'rowCount',
+	row_count: 'rowCount',
+};
+
+function normalizeRow(row) {
+	if (row === null || typeof row !== 'object') return null;
+	const normalized = {};
+	for (const [key, value] of Object.entries(row)) {
+		normalized[ROW_KEY_ALIASES[key.toLowerCase()] || key] = value;
+	}
+	return normalized;
+}
+
+function rowsFromPayload(payload) {
+	if (Array.isArray(payload)) return payload.map(normalizeRow);
+	if (payload && typeof payload === 'object' && Array.isArray(payload.data)) {
+		const meta = Array.isArray(payload.meta) ? payload.meta : null;
+		const names = meta && meta.length
+			? meta.map(entry => (entry && typeof entry === 'object' ? entry.name : entry))
+			: null;
+		const firstRow = payload.data.find(row => row !== null && row !== undefined);
+		if (Array.isArray(firstRow)) {
+			if (!names || names.some(name => typeof name !== 'string')) {
+				throw sqlError('sql_invalid_response', 'SQL API returned array rows without column metadata');
+			}
+			return payload.data.map(row => {
+				if (row === null || row === undefined) return null;
+				if (!Array.isArray(row)) return normalizeRow(row);
+				const objectRow = {};
+				names.forEach((name, index) => {
+					objectRow[ROW_KEY_ALIASES[name.toLowerCase()] || name] = row[index];
+				});
+				return objectRow;
+			});
+		}
+		return payload.data.map(normalizeRow);
+	}
+	if (payload && typeof payload === 'object' && Object.prototype.hasOwnProperty.call(payload, 'data') && payload.data !== null && payload.data !== undefined) {
+		throw sqlError('sql_invalid_response', 'SQL API returned a malformed data payload');
+	}
+	return [];
+}
+
+function parseSqlJsonResponse(text) {
+	let payload;
+	try {
+		payload = JSON.parse(text);
+	} catch (_) {
+		throw sqlError('sql_invalid_response', 'SQL API returned invalid JSON');
+	}
+	if (payload && typeof payload === 'object' && payload.success === false) {
+		throw sqlError('sql_api_error', extractApiErrorMessage(payload) || 'SQL API reported an error');
+	}
+	return rowsFromPayload(payload);
+}
+
+function toFiniteNonNegative(value, fieldName) {
+	if (value === null || value === undefined || value === '') return 0;
+	const parsed = Number(value);
+	if (!Number.isFinite(parsed) || parsed < 0) {
+		throw sqlError('sql_data_invalid', `SQL aggregate field ${fieldName} is invalid: ${String(value)}`);
+	}
+	return parsed;
+}
+
+function extractUsageAggregate(row) {
+	if (row === null || typeof row !== 'object') {
+		throw sqlError('sql_data_invalid', 'SQL aggregate row is missing');
+	}
+	const uploadBytes = Math.round(toFiniteNonNegative(row.uploadBytes, 'uploadBytes'));
+	const downloadBytes = Math.round(toFiniteNonNegative(row.downloadBytes, 'downloadBytes'));
+	const pointCount = toFiniteNonNegative(row.pointCount, 'pointCount');
+	const rowCount = toFiniteNonNegative(row.rowCount, 'rowCount');
+	if (!Number.isSafeInteger(uploadBytes) || !Number.isSafeInteger(downloadBytes)) {
+		throw sqlError('sql_data_invalid', 'SQL aggregate bytes exceed the safe integer range');
+	}
+	return { uploadBytes, downloadBytes, pointCount, rowCount };
+}
+
+function parseDayRow(row) {
+	const normalized = normalizeRow(row);
+	if (!normalized) throw sqlError('sql_data_invalid', 'SQL row is missing');
+	const customerId = normalized.customerId;
+	if (typeof customerId !== 'string' || !CUSTOMER_ID_PATTERN.test(customerId)) {
+		throw sqlError('sql_data_invalid', `Invalid customer id in SQL row: ${String(customerId)}`);
+	}
+	return { customerId, ...extractUsageAggregate(normalized) };
+}
+
+async function queryAnalyticsEngineSql(fetchImpl, config, query) {
+	let response;
+	try {
+		response = await fetchImpl(sqlEndpoint(config.accountId), {
+			method: 'POST',
+			headers: {
+				'Authorization': `Bearer ${config.apiToken}`,
+				'Content-Type': 'text/plain',
+			},
+			body: query,
+		});
+	} catch (error) {
+		throw sqlError('sql_network', `SQL request failed: ${error?.message || error}`);
+	}
+	if (!response || typeof response.status !== 'number') {
+		throw sqlError('sql_invalid_response', 'SQL API returned an invalid response object');
+	}
+	if (response.status < 200 || response.status >= 300) {
+		let message = `SQL API returned HTTP ${response.status}`;
+		try {
+			const text = typeof response.text === 'function' ? await response.text() : '';
+			if (text) message = extractApiErrorMessage(JSON.parse(text)) || message;
+		} catch (_) { /* keep the HTTP status message */ }
+		throw sqlError(`sql_http_${response.status}`, message);
+	}
+	let text;
+	try {
+		text = typeof response.text === 'function' ? await response.text() : String(response);
+	} catch (error) {
+		throw sqlError('sql_invalid_response', `SQL response body could not be read: ${error?.message || error}`);
+	}
+	return parseSqlJsonResponse(text);
+}
+
+// ---------------------------------------------------------------- records
+
+function parseUsageRecord(value) {
+	let usage = value;
+	if (typeof value === 'string') {
+		try {
+			usage = JSON.parse(value);
+		} catch (_) {
+			throw sqlError('invalid_usage_record', 'Invalid membership usage record');
+		}
+	}
+	const valid = usage && typeof usage === 'object'
+		&& MEMBERSHIP_USAGE_FIELDS.every(field => Object.prototype.hasOwnProperty.call(usage, field))
+		&& Object.keys(usage).length === MEMBERSHIP_USAGE_FIELDS.length
+		&& usage.schemaVersion === 4
+		&& usage.kind === 'membership-usage'
+		&& typeof usage.customerId === 'string' && CUSTOMER_ID_PATTERN.test(usage.customerId)
+		&& Number.isSafeInteger(usage.settledUsedBytes) && usage.settledUsedBytes >= 0
+		&& Number.isSafeInteger(usage.usageUpdatedAt) && usage.usageUpdatedAt >= 0
+		&& Number.isSafeInteger(usage.usageSettledThrough) && usage.usageSettledThrough >= 0
+		&& typeof usage.quotaExceeded === 'boolean'
+		&& typeof usage.unlimitedTraffic === 'boolean'
+		&& (usage.unlimitedTraffic === true ? usage.quotaBytes === null : Number.isSafeInteger(usage.quotaBytes) && usage.quotaBytes > 0)
+		&& Number.isSafeInteger(usage.revision) && usage.revision >= 1;
+	if (!valid) throw sqlError('invalid_usage_record', 'Invalid membership usage record');
+	return usage;
+}
+
+// Applies one day's aggregate to a usage record. `settledThroughMs` is the UTC ms of the
+// settled local day boundary, which doubles as the per-customer idempotency marker.
+function computeMembershipUsageSettlement(usage, aggregate, settledThroughMs, nowMs) {
+	const parsed = parseUsageRecord(usage);
+	if (!Number.isSafeInteger(settledThroughMs) || settledThroughMs < 0 || !Number.isSafeInteger(nowMs) || nowMs < 0) {
+		throw sqlError('invalid_window', 'Invalid settlement timestamps');
+	}
+	if (settledThroughMs <= parsed.usageSettledThrough) throw sqlError('window_not_advancing', 'Settlement day does not advance the customer marker');
+	if (!aggregate || !Number.isSafeInteger(aggregate.uploadBytes) || aggregate.uploadBytes < 0
+		|| !Number.isSafeInteger(aggregate.downloadBytes) || aggregate.downloadBytes < 0) {
+		throw sqlError('invalid_aggregate', 'Invalid usage aggregate');
+	}
+	const additionalBytes = aggregate.uploadBytes + aggregate.downloadBytes;
+	if (!Number.isSafeInteger(additionalBytes) || additionalBytes < 0) throw sqlError('invalid_aggregate', 'Settled bytes overflow');
+	const settledUsedBytes = parsed.settledUsedBytes + additionalBytes;
+	if (!Number.isSafeInteger(settledUsedBytes) || settledUsedBytes < parsed.settledUsedBytes) throw sqlError('invalid_aggregate', 'Settled bytes overflow');
+	const usageRevision = parsed.revision + 1;
+	if (!Number.isSafeInteger(usageRevision) || usageRevision < 2) throw sqlError('invalid_record', 'Usage revision overflow');
+	return {
+		schemaVersion: 4,
+		kind: 'membership-usage',
+		customerId: parsed.customerId,
+		quotaBytes: parsed.quotaBytes,
+		settledUsedBytes,
+		quotaExceeded: parsed.unlimitedTraffic === false && settledUsedBytes >= parsed.quotaBytes,
+		usageUpdatedAt: nowMs,
+		usageSettledThrough: settledThroughMs,
+		unlimitedTraffic: parsed.unlimitedTraffic,
+		revision: usageRevision,
+	};
+}
+
+// ---------------------------------------------------------------- day pipeline
+
+async function kvGet(env, key) {
+	try {
+		return await env.KV.get(key);
+	} catch (error) {
+		const wrapped = new Error(`KV get failed for ${key}: ${error?.message || error}`);
+		wrapped.code = 'kv_get_failed';
+		throw wrapped;
+	}
+}
+
+async function kvPut(env, key, value) {
+	try {
+		return await env.KV.put(key, value);
+	} catch (error) {
+		const wrapped = new Error(`KV put failed for ${key}: ${error?.message || error}`);
+		wrapped.code = 'kv_put_failed';
+		throw wrapped;
+	}
+}
+
+async function mapWithConcurrency(items, concurrency, mapper) {
+	const results = new Array(items.length);
+	let nextIndex = 0;
+	async function worker() {
+		while (nextIndex < items.length) {
+			const index = nextIndex++;
+			results[index] = await mapper(items[index], index);
+		}
+	}
+	await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, () => worker()));
+	return results;
+}
+
+// One KV get + one KV put per customer with traffic. Missing/corrupt records and
+// KV errors are reported per customer; the day itself still completes.
+async function processDayCustomer({ env, customerId, aggregate, dayStartMs, nowMs }) {
+	let raw;
+	try {
+		raw = await kvGet(env, MEMBERSHIP_USAGE_KEY_PREFIX + customerId);
+	} catch (error) {
+		return { customerId, status: 'failed', error: error.code, message: error.message };
+	}
+	if (raw === null || raw === undefined) return { customerId, status: 'skipped', reason: 'missing_usage' };
+	let usage;
+	try {
+		usage = parseUsageRecord(raw);
+	} catch (error) {
+		return { customerId, status: 'skipped', reason: error.code || 'invalid_usage_record', message: error.message };
+	}
+	if (usage.usageSettledThrough >= dayStartMs) {
+		return { customerId, status: 'skipped', reason: 'already_settled' };
+	}
+	let updated;
+	try {
+		updated = computeMembershipUsageSettlement(usage, aggregate, dayStartMs, nowMs);
+	} catch (error) {
+		// Pure computation failure is definitive (same input throws every time), so it is
+		// reported as a skip and does not block the day cursor.
+		return { customerId, status: 'skipped', reason: error.code || 'invalid_record', message: error.message };
+	}
+	try {
+		await kvPut(env, MEMBERSHIP_USAGE_KEY_PREFIX + customerId, JSON.stringify(updated));
+	} catch (error) {
+		return { customerId, status: 'failed', error: error.code, message: error.message };
+	}
+	return {
+		customerId,
+		status: 'settled',
+		additionalBytes: aggregate.uploadBytes + aggregate.downloadBytes,
+		uploadBytes: aggregate.uploadBytes,
+		downloadBytes: aggregate.downloadBytes,
+		settledUsedBytes: updated.settledUsedBytes,
+		usageSettledThrough: updated.usageSettledThrough,
+		usageRevision: updated.revision,
+	};
+}
+
+// Settles one completed natural day. Throws on any day-level failure (SQL request
+// error, malformed response). Row-level and definitive customer-level problems are
+// reported but do not fail the day; temporary customer KV errors set `blocked` so the
+// caller does not advance the global day cursor.
+async function settleSettlementDay({ env, config, dayKey, fetchImpl, nowMs }) {
+	const query = buildMembershipUsageDayQuery(config, dayKey, config.timezone);
+	const rows = await queryAnalyticsEngineSql(fetchImpl, config, query);
+	const dayStartMs = dayStartUtcMs(dayKey, config.timezone);
+
+	const customers = new Map();
+	const invalidRows = [];
+	for (const row of rows) {
+		try {
+			const parsed = parseDayRow(row);
+			if (!customers.has(parsed.customerId)) customers.set(parsed.customerId, parsed);
+		} catch (error) {
+			const rawCustomerId = row && typeof row === 'object'
+				? (row.customerId ?? row.customer_id ?? (Array.isArray(row) ? row[0] : undefined))
+				: undefined;
+			invalidRows.push({ customerId: String(rawCustomerId ?? '(unknown)'), row, reason: error.code || 'unknown' });
+		}
+	}
+
+	const results = await mapWithConcurrency([...customers.values()], config.concurrency, async entry => {
+		return processDayCustomer({ env, customerId: entry.customerId, aggregate: entry, dayStartMs, nowMs });
+	});
+	const settled = results.filter(result => result.status === 'settled');
+	const skipped = results.filter(result => result.status === 'skipped');
+	const failed = results.filter(result => result.status === 'failed');
+	const blocked = failed.length > 0;
+	return {
+		ok: true,
+		day: dayKey,
+		customers: settled.length,
+		settled,
+		skipped: [...skipped, ...invalidRows.map(row => ({ customerId: row.customerId, reason: row.reason }))],
+		failed,
+		blocked,
+	};
+}
+
+async function runMembershipUsageSettlement(options = {}) {
+	const env = options.env || {};
+	const fetchImpl = options.fetchImpl === undefined
+		? (typeof globalThis !== 'undefined' && typeof globalThis.fetch === 'function' ? globalThis.fetch.bind(globalThis) : null)
+		: options.fetchImpl;
+	const nowMs = Number.isSafeInteger(options.nowMs) && options.nowMs > 0 ? options.nowMs : Date.now();
+	const logger = typeof options.logger === 'function'
+		? options.logger
+		: (message, level) => {
+			if (level === 'error' || level === 'warn') console.warn(message);
+			else console.log(message);
+		};
+
+	const config = getMembershipSettlementConfig(env);
+	const validated = validateSettlementConfig(config);
+	if (!validated.ok) return { ok: false, skipped: validated.reason };
+	if (!fetchImpl) return { ok: false, error: 'fetch_unavailable' };
+	if (!env.KV || typeof env.KV.get !== 'function' || typeof env.KV.put !== 'function') {
+		return { ok: false, error: 'kv_unavailable' };
+	}
+
+	const todayKey = localDayKey(nowMs, config.timezone);
+	let cursorDay;
+	try {
+		cursorDay = await kvGet(env, MEMBERSHIP_SETTLEMENT_CURSOR_KEY);
+	} catch (error) {
+		return { ok: false, error: 'cursor_get_failed' };
+	}
+
+	let days;
+	let skippedDays;
+	try {
+		({ days, skippedDays } = planSettlementDays(cursorDay, todayKey, config.maxBackfillDays));
+	} catch (error) {
+		return { ok: false, error: error.code || 'invalid_cursor' };
+	}
+	if (days.length === 0) {
+		return {
+			ok: true,
+			mode: 'daily-settlement',
+			nowMs,
+			today: todayKey,
+			cursor: cursorDay || null,
+			days: [],
+			skippedDays,
+			dayDetails: [],
+			sqlQueries: 0,
+			customers: 0,
+			settledCustomers: 0,
+			skippedCustomers: 0,
+			failedCustomers: 0,
+			kvWrites: 0,
+		};
+	}
+
+	const dayResults = [];
+	let sqlQueries = 0;
+	for (const dayKey of days) {
+		sqlQueries++;
+		let dayResult;
+		try {
+			dayResult = await settleSettlementDay({ env, config, dayKey, fetchImpl, nowMs });
+		} catch (error) {
+			logger(`[membership-settlement] day ${dayKey} failed: ${error?.message || error}`, 'error');
+			return {
+				ok: false,
+				error: error?.code || 'unknown',
+				failedDay: dayKey,
+				processedDays: dayResults,
+				sqlQueries,
+			};
+		}
+		if (dayResult.blocked) {
+			logger(`[membership-settlement] day ${dayKey} blocked by ${dayResult.failed.length} customer KV error(s), cursor not advanced`, 'warn');
+			return {
+				ok: false,
+				error: 'day_blocked_by_kv_errors',
+				blockedDay: dayKey,
+				blockedCustomers: dayResult.failed,
+				dayDetails: [...dayResults, dayResult],
+				sqlQueries,
+			};
+		}
+		try {
+			await kvPut(env, MEMBERSHIP_SETTLEMENT_CURSOR_KEY, dayKey);
+		} catch (error) {
+			logger(`[membership-settlement] cursor write failed for day ${dayKey}: ${error?.message || error}`, 'error');
+			return {
+				ok: false,
+				error: 'cursor_put_failed',
+				failedDay: dayKey,
+				processedDays: dayResults,
+				sqlQueries,
+			};
+		}
+		dayResults.push(dayResult);
+	}
+
+	const settledCustomers = dayResults.reduce((sum, day) => sum + day.settled.length, 0);
+	const skippedCustomers = dayResults.reduce((sum, day) => sum + day.skipped.length, 0);
+	const failedCustomers = dayResults.reduce((sum, day) => sum + day.failed.length, 0);
+	logger(`[membership-settlement] done: days=${dayResults.length} settled=${settledCustomers} skipped=${skippedCustomers} failed=${failedCustomers}`, 'info');
+	return {
+		ok: true,
+		mode: 'daily-settlement',
+		nowMs,
+		today: todayKey,
+		cursor: days[days.length - 1],
+		days: days.map(day => day),
+		skippedDays,
+		dayDetails: dayResults,
+		sqlQueries,
+		customers: settledCustomers + skippedCustomers + failedCustomers,
+		settledCustomers,
+		skippedCustomers,
+		failedCustomers,
+		kvWrites: settledCustomers + dayResults.length,
+	};
+}
+
+export {
+	getMembershipSettlementConfig,
+	validateSettlementConfig,
+	dayStartUtcMs,
+	dayEndUtcMs,
+	localDayKey,
+	planSettlementDays,
+	buildMembershipUsageDayQuery,
+	parseSqlJsonResponse,
+	extractUsageAggregate,
+	parseDayRow,
+	parseUsageRecord,
+	computeMembershipUsageSettlement,
+	runMembershipUsageSettlement,
+};
