@@ -664,6 +664,229 @@ async function runMembershipUsageSettlement(options = {}) {
 	};
 }
 
+// ---------------------------------------------------------------- frequency policy
+
+// Fixed 12-hour buckets in Asia/Shanghai (fixed UTC+8, no DST). Local 00:00 equals
+// the previous day 16:00 UTC, so every bucket boundary is at UTC 16:00 or 04:00.
+// This module deliberately reuses the existing "usage-v1" policy version constant so
+// the frequency query reads the same data points as the daily settlement query.
+const FREQUENCY_BUCKET_HOURS = 12;
+const FREQUENCY_BUCKET_MS = FREQUENCY_BUCKET_HOURS * 3600 * 1000;
+const SHANGHAI_MIDNIGHT_UTC_OFFSET_MS = 16 * 3600 * 1000;
+
+// Start (UTC ms) of the Asia/Shanghai 12-hour bucket containing `nowMs`.
+function frequencyBucketStartMs(nowMs) {
+	if (!Number.isSafeInteger(nowMs) || nowMs < 0) throw sqlError('invalid_time', 'Invalid timestamp for frequency bucket');
+	const shifted = nowMs - SHANGHAI_MIDNIGHT_UTC_OFFSET_MS;
+	const index = Math.floor(shifted / FREQUENCY_BUCKET_MS);
+	return index * FREQUENCY_BUCKET_MS + SHANGHAI_MIDNIGHT_UTC_OFFSET_MS;
+}
+
+// Exclusive end (UTC ms) of the newest fully closed 12-hour bucket that is at least
+// `closedBucketDelayHours` old. The in-progress bucket is never included.
+function getLatestClosedBucketEnd(nowMs, closedBucketDelayHours = 0) {
+	if (!Number.isSafeInteger(nowMs) || nowMs < 0) throw sqlError('invalid_time', 'Invalid timestamp for closed bucket');
+	if (!Number.isFinite(closedBucketDelayHours) || closedBucketDelayHours < 0) {
+		throw sqlError('invalid_policy', 'closedBucketDelayHours must be non-negative');
+	}
+	const delayMs = Math.floor(closedBucketDelayHours * 3600 * 1000);
+	let end = frequencyBucketStartMs(nowMs);
+	while (nowMs - end < delayMs) end -= FREQUENCY_BUCKET_MS;
+	return end;
+}
+
+function parseFrequencySettlementPolicy(rawJson) {
+	let parsed;
+	if (typeof rawJson === 'string' && rawJson.trim() !== '') {
+		try {
+			parsed = JSON.parse(rawJson);
+		} catch (_) {
+			return { ok: false, reason: 'invalid_json' };
+		}
+	} else if (rawJson && typeof rawJson === 'object') {
+		parsed = rawJson;
+	} else {
+		return { ok: false, reason: 'missing_policy' };
+	}
+
+	const positiveInt = (value, fallback, max = 100000) => {
+		const number = Number(value);
+		return Number.isInteger(number) && number > 0 && number <= max ? number : fallback;
+	};
+	const nonNegativeInt = (value, fallback, max = 100000) => {
+		const number = Number(value);
+		return Number.isInteger(number) && number >= 0 && number <= max ? number : fallback;
+	};
+	const bucketMultiple = (value, fallback) => {
+		const number = positiveInt(value, fallback);
+		return number % FREQUENCY_BUCKET_HOURS === 0 ? number : null;
+	};
+
+	const timezone = typeof parsed.timezone === 'string' && parsed.timezone.trim()
+		? parsed.timezone.trim()
+		: 'Asia/Shanghai';
+	if (timezone !== 'Asia/Shanghai') return { ok: false, reason: 'unsupported_timezone' };
+
+	const bucketHours = Number(parsed.bucketHours);
+	if (bucketHours !== FREQUENCY_BUCKET_HOURS) return { ok: false, reason: 'bucket_hours_not_12' };
+
+	const highFrequencyThreshold = Number(parsed.highFrequencyThreshold);
+	const mediumFrequencyThreshold = Number(parsed.mediumFrequencyThreshold);
+	if (!Number.isInteger(highFrequencyThreshold) || highFrequencyThreshold < 0
+		|| !Number.isInteger(mediumFrequencyThreshold) || mediumFrequencyThreshold < 0) {
+		return { ok: false, reason: 'missing_connect_thresholds' };
+	}
+	if (highFrequencyThreshold <= mediumFrequencyThreshold) return { ok: false, reason: 'invalid_thresholds' };
+
+	const highSettlementHours = bucketMultiple(parsed.highSettlementHours, 12);
+	const mediumSettlementHours = bucketMultiple(parsed.mediumSettlementHours, 24);
+	const lowSettlementHours = bucketMultiple(parsed.lowSettlementHours, 72);
+	if (highSettlementHours === null || mediumSettlementHours === null || lowSettlementHours === null) {
+		return { ok: false, reason: 'settlement_hours_not_bucket_multiple' };
+	}
+
+	const closedBucketDelayHours = nonNegativeInt(parsed.closedBucketDelayHours, 2, 168);
+	const lookbackHours = positiveInt(parsed.lookbackHours, Math.max(lowSettlementHours + closedBucketDelayHours, 96), 100000);
+	if (lookbackHours < lowSettlementHours + closedBucketDelayHours) return { ok: false, reason: 'lookback_too_small' };
+
+	return {
+		ok: true,
+		policy: {
+			bucketHours,
+			cronIntervalHours: positiveInt(parsed.cronIntervalHours, 12, 168),
+			frequencyWindowHours: positiveInt(parsed.frequencyWindowHours, 24, 168),
+			highFrequencyThreshold,
+			mediumFrequencyThreshold,
+			highSettlementHours,
+			mediumSettlementHours,
+			lowSettlementHours,
+			lookbackHours,
+			closedBucketDelayHours,
+			timezone,
+		},
+	};
+}
+
+// One unified GROUP BY query over every customer and every closed 12-hour bucket in the
+// window. Connection count comes only from blob3 = 'connect'; traffic sums keep the
+// Analytics sampling compensation (_sample_interval) and the local write-time weight
+// (double3). The query never references UUIDs, tokens, names, targets or KV keys.
+function buildFrequencyBucketQuery({ dataset, recordType = MEMBERSHIP_USAGE_RECORD_TYPE, policyVersion = MEMBERSHIP_USAGE_POLICY_VERSION }, windowStartMs, windowEndMs) {
+	if (typeof dataset !== 'string' || !DATASET_PATTERN.test(dataset)) throw sqlError('invalid_dataset', 'Invalid Analytics Engine dataset name');
+	if (!Number.isSafeInteger(windowStartMs) || !Number.isSafeInteger(windowEndMs) || windowEndMs <= windowStartMs) {
+		throw sqlError('invalid_window', 'Invalid frequency query window');
+	}
+	const fromSec = Math.floor(windowStartMs / 1000);
+	const toSec = Math.floor(windowEndMs / 1000);
+	const bucketSeconds = FREQUENCY_BUCKET_HOURS * 3600;
+	const offsetSeconds = Math.floor(SHANGHAI_MIDNIGHT_UTC_OFFSET_MS / 1000);
+	return [
+		'SELECT',
+		'  index1 AS customerId,',
+		`  toInt64(floor((toUnixTimestamp(timestamp) - ${offsetSeconds}) / ${bucketSeconds})) AS bucketIndex,`,
+		'  SUM(_sample_interval * double1 * double3) AS uploadBytes,',
+		'  SUM(_sample_interval * double2 * double3) AS downloadBytes,',
+		'  SUM(',
+		'    IF(',
+		"      blob3 = 'connect',",
+		'      _sample_interval * double4,',
+		'      0',
+		'    )',
+		'  ) AS connectCount,',
+		'  MAX(timestamp) AS latestEventTs',
+		`FROM ${dataset}`,
+		`WHERE blob1 = '${recordType}'`,
+		`  AND blob2 = '${MEMBERSHIP_USAGE_TRANSPORT}'`,
+		`  AND blob4 = '${policyVersion}'`,
+		`  AND timestamp >= toDateTime(${fromSec})`,
+		`  AND timestamp < toDateTime(${toSec})`,
+		'GROUP BY index1, bucketIndex',
+	].join('\n');
+}
+
+// Converts the SQL rows (one per customer per bucket) into JS bucket records with
+// absolute UTC bucket boundaries and milliseconds.
+function parseFrequencyBucketRows(rows) {
+	if (!Array.isArray(rows)) throw sqlError('sql_data_invalid', 'Frequency bucket rows must be an array');
+	const buckets = [];
+	for (const rawRow of rows) {
+		const row = normalizeRow(rawRow);
+		if (!row) throw sqlError('sql_data_invalid', 'Frequency bucket row is missing');
+		const customerId = row.customerId;
+		if (typeof customerId !== 'string' || !CUSTOMER_ID_PATTERN.test(customerId)) {
+			throw sqlError('sql_data_invalid', 'Invalid customer id in frequency bucket row');
+		}
+		const bucketIndex = toFiniteNonNegative(row.bucketIndex, 'bucketIndex');
+		if (!Number.isSafeInteger(bucketIndex)) throw sqlError('sql_data_invalid', 'Invalid bucket index');
+		const uploadBytes = Math.round(toFiniteNonNegative(row.uploadBytes, 'uploadBytes'));
+		const downloadBytes = Math.round(toFiniteNonNegative(row.downloadBytes, 'downloadBytes'));
+		if (!Number.isSafeInteger(uploadBytes) || !Number.isSafeInteger(downloadBytes)) {
+			throw sqlError('sql_data_invalid', 'Frequency bucket bytes exceed the safe integer range');
+		}
+		const connectCount = toFiniteNonNegative(row.connectCount, 'connectCount');
+		const latestEventTs = toFiniteNonNegative(row.latestEventTs, 'latestEventTs');
+		buckets.push({
+			customerId,
+			bucketStartMs: bucketIndex * FREQUENCY_BUCKET_MS + SHANGHAI_MIDNIGHT_UTC_OFFSET_MS,
+			bucketEndMs: (bucketIndex + 1) * FREQUENCY_BUCKET_MS + SHANGHAI_MIDNIGHT_UTC_OFFSET_MS,
+			uploadBytes,
+			downloadBytes,
+			connectCount,
+			latestEventMs: Math.round(latestEventTs * 1000),
+		});
+	}
+	return buckets;
+}
+
+// Frequency tier classification. High frequency only shortens the settlement interval;
+// it never disables a customer or changes their status.
+function classifyCustomerFrequency(connectsInWindow, policy) {
+	if (!policy || !Number.isSafeInteger(policy.highFrequencyThreshold) || !Number.isSafeInteger(policy.mediumFrequencyThreshold)) {
+		throw sqlError('invalid_policy', 'Frequency thresholds are required');
+	}
+	if (!Number.isFinite(connectsInWindow) || connectsInWindow < 0) throw sqlError('invalid_aggregate', 'Invalid connect count');
+	if (connectsInWindow >= policy.highFrequencyThreshold) {
+		return { tier: 'high', settlementIntervalHours: policy.highSettlementHours };
+	}
+	if (connectsInWindow >= policy.mediumFrequencyThreshold) {
+		return { tier: 'medium', settlementIntervalHours: policy.mediumSettlementHours };
+	}
+	return { tier: 'low', settlementIntervalHours: policy.lowSettlementHours };
+}
+
+// Groups buckets per customer, computes the connect count over the configured frequency
+// window and returns the tier. Pure computation: no KV reads or writes, no status
+// changes. "Is the customer due for settlement" is deliberately left to phase 3.
+function aggregateCustomerFrequencyWindow(rows, policy, nowMs) {
+	if (!policy || !Number.isSafeInteger(nowMs) || nowMs < 0) throw sqlError('invalid_policy', 'Invalid frequency policy or timestamp');
+	const buckets = Array.isArray(rows) ? rows : parseFrequencyBucketRows(rows);
+	const byCustomer = new Map();
+	for (const bucket of buckets) {
+		if (!byCustomer.has(bucket.customerId)) byCustomer.set(bucket.customerId, []);
+		byCustomer.get(bucket.customerId).push(bucket);
+	}
+	const windowStartMs = nowMs - policy.frequencyWindowHours * 3600 * 1000;
+	const results = [];
+	for (const [customerId, customerBuckets] of byCustomer) {
+		let connectsInWindow = 0;
+		let latestEventMs = 0;
+		for (const bucket of customerBuckets) {
+			if (bucket.bucketEndMs > windowStartMs) connectsInWindow += Number.isFinite(bucket.connectCount) ? bucket.connectCount : 0;
+			if (bucket.latestEventMs > latestEventMs) latestEventMs = bucket.latestEventMs;
+		}
+		const tier = classifyCustomerFrequency(connectsInWindow, policy);
+		results.push({
+			customerId,
+			frequencyTier: tier.tier,
+			settlementIntervalHours: tier.settlementIntervalHours,
+			connectsInWindow,
+			latestEventMs,
+			buckets: customerBuckets.slice().sort((a, b) => a.bucketStartMs - b.bucketStartMs),
+		});
+	}
+	return results.sort((a, b) => a.customerId.localeCompare(b.customerId));
+}
+
 export {
 	getMembershipSettlementConfig,
 	validateSettlementConfig,
@@ -678,4 +901,11 @@ export {
 	parseUsageRecord,
 	computeMembershipUsageSettlement,
 	runMembershipUsageSettlement,
+	frequencyBucketStartMs,
+	getLatestClosedBucketEnd,
+	parseFrequencySettlementPolicy,
+	buildFrequencyBucketQuery,
+	parseFrequencyBucketRows,
+	classifyCustomerFrequency,
+	aggregateCustomerFrequencyWindow,
 };
