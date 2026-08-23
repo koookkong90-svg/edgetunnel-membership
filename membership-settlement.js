@@ -783,7 +783,7 @@ function buildFrequencyBucketQuery({ dataset, recordType = MEMBERSHIP_USAGE_RECO
 	return [
 		'SELECT',
 		'  index1 AS customerId,',
-		`  toInt64(floor((toUnixTimestamp(timestamp) - ${offsetSeconds}) / ${bucketSeconds})) AS bucketIndex,`,
+		`  intDiv(toUInt32(timestamp) - ${offsetSeconds}, ${bucketSeconds}) AS bucketIndex,`,
 		'  SUM(_sample_interval * double1 * double3) AS uploadBytes,',
 		'  SUM(_sample_interval * double2 * double3) AS downloadBytes,',
 		'  SUM(',

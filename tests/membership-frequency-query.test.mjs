@@ -106,6 +106,14 @@ test('SQL 只生成一条统一 GROUP BY 查询（不按客户拆分）', () => 
 	assert.doesNotMatch(query, /GROUP BY index1\b(?!, bucketIndex)/);
 });
 
+test('bucketIndex 使用 Analytics Engine 兼容的 intDiv(toUInt32(timestamp)) 表达式', () => {
+	const query = buildFrequencyBucketQuery({ dataset: DATASET, policyVersion: POLICY_VERSION }, 0, BUCKET_MS * 2);
+	assert.match(query, /intDiv\(toUInt32\(timestamp\) - 57600, 43200\) AS bucketIndex/);
+	assert.doesNotMatch(query, /toInt64\(/);
+	assert.doesNotMatch(query, /toUnixTimestamp\(/);
+	assert.doesNotMatch(query, /floor\(/);
+});
+
 test('Analytics 采样补偿公式正确（上传/下载/connect）', () => {
 	const query = buildFrequencyBucketQuery({ dataset: DATASET, policyVersion: POLICY_VERSION }, 0, BUCKET_MS * 2);
 	assert.match(query, /SUM\(_sample_interval \* double1 \* double3\) AS uploadBytes/);
