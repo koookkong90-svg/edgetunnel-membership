@@ -810,30 +810,30 @@ function parseFrequencyBucketRows(rows) {
 	if (!Array.isArray(rows)) throw sqlError('sql_data_invalid', 'Frequency bucket rows must be an array');
 	const buckets = [];
 	for (const rawRow of rows) {
-		const row = normalizeRow(rawRow);
-		if (!row) throw sqlError('sql_data_invalid', 'Frequency bucket row is missing');
-		const customerId = row.customerId;
-		if (typeof customerId !== 'string' || !CUSTOMER_ID_PATTERN.test(customerId)) {
-			throw sqlError('sql_data_invalid', 'Invalid customer id in frequency bucket row');
+		try {
+			const row = normalizeRow(rawRow);
+			if (!row) continue;
+			const customerId = row.customerId;
+			if (typeof customerId !== 'string' || !CUSTOMER_ID_PATTERN.test(customerId)) continue;
+			const bucketIndex = toFiniteNonNegative(row.bucketIndex, 'bucketIndex');
+			if (!Number.isSafeInteger(bucketIndex)) continue;
+			const uploadBytes = Math.round(toFiniteNonNegative(row.uploadBytes, 'uploadBytes'));
+			const downloadBytes = Math.round(toFiniteNonNegative(row.downloadBytes, 'downloadBytes'));
+			if (!Number.isSafeInteger(uploadBytes) || !Number.isSafeInteger(downloadBytes)) continue;
+			const connectCount = toFiniteNonNegative(row.connectCount, 'connectCount');
+			const latestEventTs = toFiniteNonNegative(row.latestEventTs, 'latestEventTs');
+			buckets.push({
+				customerId,
+				bucketStartMs: bucketIndex * FREQUENCY_BUCKET_MS + SHANGHAI_MIDNIGHT_UTC_OFFSET_MS,
+				bucketEndMs: (bucketIndex + 1) * FREQUENCY_BUCKET_MS + SHANGHAI_MIDNIGHT_UTC_OFFSET_MS,
+				uploadBytes,
+				downloadBytes,
+				connectCount,
+				latestEventMs: Math.round(latestEventTs * 1000),
+			});
+		} catch (_) {
+			// Malformed rows are skipped conservatively so one bad row cannot fail the run.
 		}
-		const bucketIndex = toFiniteNonNegative(row.bucketIndex, 'bucketIndex');
-		if (!Number.isSafeInteger(bucketIndex)) throw sqlError('sql_data_invalid', 'Invalid bucket index');
-		const uploadBytes = Math.round(toFiniteNonNegative(row.uploadBytes, 'uploadBytes'));
-		const downloadBytes = Math.round(toFiniteNonNegative(row.downloadBytes, 'downloadBytes'));
-		if (!Number.isSafeInteger(uploadBytes) || !Number.isSafeInteger(downloadBytes)) {
-			throw sqlError('sql_data_invalid', 'Frequency bucket bytes exceed the safe integer range');
-		}
-		const connectCount = toFiniteNonNegative(row.connectCount, 'connectCount');
-		const latestEventTs = toFiniteNonNegative(row.latestEventTs, 'latestEventTs');
-		buckets.push({
-			customerId,
-			bucketStartMs: bucketIndex * FREQUENCY_BUCKET_MS + SHANGHAI_MIDNIGHT_UTC_OFFSET_MS,
-			bucketEndMs: (bucketIndex + 1) * FREQUENCY_BUCKET_MS + SHANGHAI_MIDNIGHT_UTC_OFFSET_MS,
-			uploadBytes,
-			downloadBytes,
-			connectCount,
-			latestEventMs: Math.round(latestEventTs * 1000),
-		});
 	}
 	return buckets;
 }
@@ -887,6 +887,203 @@ function aggregateCustomerFrequencyWindow(rows, policy, nowMs) {
 	return results.sort((a, b) => a.customerId.localeCompare(b.customerId));
 }
 
+// End (UTC ms) of the 12-hour bucket that is currently in progress at `nowMs`.
+function getCurrentFrequencyBucketEnd(nowMs) {
+	return frequencyBucketStartMs(nowMs) + FREQUENCY_BUCKET_MS;
+}
+
+function isValidBucketBoundaryMs(ms) {
+	return Number.isSafeInteger(ms) && ms >= 0 && (ms - SHANGHAI_MIDNIGHT_UTC_OFFSET_MS) % FREQUENCY_BUCKET_MS === 0;
+}
+
+// Per-customer step of the frequency-layered runner. At most one KV get and, when due,
+// at most one KV put. Watermark edge cases are handled conservatively (see the report
+// and the test suite): invalid watermarks are skipped rather than cutting buckets.
+async function processFrequencyCustomer({ env, entry, cutoffMs, windowStartMs, nowMs }) {
+	const customerId = entry.customerId;
+	let raw;
+	try {
+		raw = await kvGet(env, MEMBERSHIP_USAGE_KEY_PREFIX + customerId);
+	} catch (error) {
+		return { customerId, status: 'failed', error: error.code, message: error.message };
+	}
+	if (raw === null || raw === undefined) return { customerId, status: 'skipped', reason: 'missing_usage' };
+	let usage;
+	try {
+		usage = parseUsageRecord(raw);
+	} catch (error) {
+		return { customerId, status: 'skipped', reason: error.code || 'invalid_usage_record', message: error.message };
+	}
+
+	// Case 2/3: zero watermark.
+	if (usage.usageSettledThrough === 0) {
+		if (usage.settledUsedBytes === 0) {
+			const earliestStartMs = entry.buckets.length > 0 ? entry.buckets[0].bucketStartMs : null;
+			if (!Number.isSafeInteger(earliestStartMs)) return { customerId, status: 'skipped', reason: 'no_closed_buckets' };
+			usage = { ...usage, usageSettledThrough: earliestStartMs };
+		} else {
+			return { customerId, status: 'skipped', reason: 'missing_watermark_with_existing_usage' };
+		}
+	}
+	// Non-boundary watermark: conservative skip, never cut a bucket arbitrarily.
+	if (!isValidBucketBoundaryMs(usage.usageSettledThrough)) {
+		return { customerId, status: 'skipped', reason: 'invalid_watermark' };
+	}
+	// Case 5: already settled through (or beyond) this cutoff.
+	if (usage.usageSettledThrough >= cutoffMs) {
+		return { customerId, status: 'skipped', reason: 'already_settled' };
+	}
+	// Case 4: watermark older than the lookback window; settling now would lose old data.
+	if (usage.usageSettledThrough < windowStartMs) {
+		return { customerId, status: 'skipped', reason: 'watermark_before_lookback' };
+	}
+
+	const elapsedHours = (cutoffMs - usage.usageSettledThrough) / 3600000;
+	if (elapsedHours < entry.settlementIntervalHours) {
+		return {
+			customerId,
+			status: 'not_due',
+			tier: entry.frequencyTier,
+			settlementIntervalHours: entry.settlementIntervalHours,
+			elapsedHours,
+		};
+	}
+
+	let uploadBytes = 0, downloadBytes = 0;
+	for (const bucket of entry.buckets) {
+		if (bucket.bucketEndMs > usage.usageSettledThrough && bucket.bucketEndMs <= cutoffMs) {
+			uploadBytes += bucket.uploadBytes;
+			downloadBytes += bucket.downloadBytes;
+		}
+	}
+	if (!Number.isSafeInteger(uploadBytes) || !Number.isSafeInteger(downloadBytes)) {
+		return { customerId, status: 'skipped', reason: 'bucket_bytes_overflow' };
+	}
+	let updated;
+	try {
+		updated = computeMembershipUsageSettlement(usage, { uploadBytes, downloadBytes }, cutoffMs, nowMs);
+	} catch (error) {
+		return { customerId, status: 'skipped', reason: error.code || 'invalid_record', message: error.message };
+	}
+	try {
+		await kvPut(env, MEMBERSHIP_USAGE_KEY_PREFIX + customerId, JSON.stringify(updated));
+	} catch (error) {
+		return { customerId, status: 'failed', error: error.code, message: error.message };
+	}
+	return {
+		customerId,
+		status: 'settled',
+		tier: entry.frequencyTier,
+		addedBytes: uploadBytes + downloadBytes,
+		uploadBytes,
+		downloadBytes,
+		settledUsedBytes: updated.settledUsedBytes,
+		usageSettledThrough: updated.usageSettledThrough,
+		quotaExceeded: updated.quotaExceeded,
+	};
+}
+
+// Frequency-layered settlement runner. One unified Analytics SQL per run; per customer at
+// most one KV get and, when due, at most one KV put. Not wired into any scheduled handler
+// yet: it is exported for tests and for the phase-4 standalone worker.
+async function runFrequencyLayeredSettlement(options = {}) {
+	const env = options.env || {};
+	const fetchImpl = options.fetchImpl === undefined
+		? (typeof globalThis !== 'undefined' && typeof globalThis.fetch === 'function' ? globalThis.fetch.bind(globalThis) : null)
+		: options.fetchImpl;
+	const nowMs = Number.isSafeInteger(options.nowMs) && options.nowMs > 0 ? options.nowMs : Date.now();
+	const logger = typeof options.logger === 'function'
+		? options.logger
+		: (message, level) => {
+			if (level === 'error' || level === 'warn') console.warn(message);
+			else console.log(message);
+		};
+
+	const config = getMembershipSettlementConfig(env);
+	const validated = validateSettlementConfig(config);
+	if (!validated.ok) return { ok: false, skipped: validated.reason };
+	if (!fetchImpl) return { ok: false, error: 'fetch_unavailable' };
+	if (!env.KV || typeof env.KV.get !== 'function' || typeof env.KV.put !== 'function') {
+		return { ok: false, error: 'kv_unavailable' };
+	}
+	const policyResult = parseFrequencySettlementPolicy(env.USAGE_SETTLEMENT_POLICY_JSON);
+	if (!policyResult.ok) return { ok: false, skipped: policyResult.reason };
+	const policy = policyResult.policy;
+
+	const cutoffMs = getLatestClosedBucketEnd(nowMs, policy.closedBucketDelayHours);
+	const windowStartMs = nowMs - policy.lookbackHours * 3600 * 1000;
+
+	let rows;
+	let queryCount = 0;
+	try {
+		const query = buildFrequencyBucketQuery(config, windowStartMs, cutoffMs);
+		queryCount = 1;
+		rows = await queryAnalyticsEngineSql(fetchImpl, config, query);
+	} catch (error) {
+		logger(`[membership-frequency-settlement] query failed: ${error?.message || error}`, 'error');
+		return {
+			ok: false,
+			error: error?.code || 'sql_failed',
+			queryCount,
+			cutoffMs,
+			windowStartMs,
+			customerCount: 0,
+			settledCount: 0,
+			notDueCount: 0,
+			skippedCount: 0,
+			failedCount: 0,
+			addedBytes: 0,
+			results: [],
+		};
+	}
+
+	let buckets;
+	try {
+		buckets = parseFrequencyBucketRows(rows);
+	} catch (error) {
+		return {
+			ok: false,
+			error: error?.code || 'sql_data_invalid',
+			queryCount,
+			cutoffMs,
+			windowStartMs,
+			customerCount: 0,
+			settledCount: 0,
+			notDueCount: 0,
+			skippedCount: 0,
+			failedCount: 0,
+			addedBytes: 0,
+			results: [],
+		};
+	}
+
+	const aggregated = aggregateCustomerFrequencyWindow(buckets, policy, nowMs);
+	const results = await mapWithConcurrency(aggregated, config.concurrency, async entry => {
+		return processFrequencyCustomer({ env, entry, cutoffMs, windowStartMs, nowMs });
+	});
+	const settled = results.filter(result => result.status === 'settled');
+	const notDue = results.filter(result => result.status === 'not_due');
+	const skipped = results.filter(result => result.status === 'skipped');
+	const failed = results.filter(result => result.status === 'failed');
+	const addedBytes = settled.reduce((sum, result) => sum + (result.addedBytes || 0), 0);
+	logger(`[membership-frequency-settlement] done: customers=${results.length} settled=${settled.length} notDue=${notDue.length} skipped=${skipped.length} failed=${failed.length}`, 'info');
+	return {
+		ok: true,
+		mode: 'frequency-layered',
+		nowMs,
+		queryCount,
+		customerCount: results.length,
+		settledCount: settled.length,
+		notDueCount: notDue.length,
+		skippedCount: skipped.length,
+		failedCount: failed.length,
+		addedBytes,
+		cutoffMs,
+		windowStartMs,
+		results,
+	};
+}
+
 export {
 	getMembershipSettlementConfig,
 	validateSettlementConfig,
@@ -908,4 +1105,6 @@ export {
 	parseFrequencyBucketRows,
 	classifyCustomerFrequency,
 	aggregateCustomerFrequencyWindow,
+	getCurrentFrequencyBucketEnd,
+	runFrequencyLayeredSettlement,
 };
