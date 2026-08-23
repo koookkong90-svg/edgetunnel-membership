@@ -43,7 +43,7 @@ function recordUsage(customerId, uploadBytes, downloadBytes, metadata = {}) {
 	if (!engine || typeof engine.writeDataPoint !== 'function') return Promise.resolve(false);
 	const upload = Number.isSafeInteger(uploadBytes) && uploadBytes >= 0 ? uploadBytes : 0;
 	const download = Number.isSafeInteger(downloadBytes) && downloadBytes >= 0 ? downloadBytes : 0;
-	if (upload === 0 && download === 0) return Promise.resolve(false);
+	if (upload === 0 && download === 0 && metadata?.eventKind !== 'connect') return Promise.resolve(false);
 	const point = {
 		indexes: [customerId],
 		blobs: ['usage-v1', 'vless-ws', String(metadata.eventKind || 'connection'), MEMBERSHIP_USAGE_POLICY_VERSION],
@@ -60,7 +60,7 @@ function recordUsage(customerId, uploadBytes, downloadBytes, metadata = {}) {
 function createMembershipUsageTracker(customerId, env) {
 	const engine = env?.MEMBERSHIP_USAGE;
 	const policy = getMembershipUsagePolicy(env);
-	let upload = 0, download = 0, points = 0, lastFlush = Date.now(), closed = false;
+	let upload = 0, download = 0, points = 0, lastFlush = Date.now(), closed = false, connectRecorded = false;
 	const flush = async (eventKind, sampleWeight = 1, force = false) => {
 		if (closed || points >= MEMBERSHIP_USAGE_MAX_POINTS) return;
 		if (!force && upload + download <= 0) return;
@@ -88,7 +88,12 @@ function createMembershipUsageTracker(customerId, env) {
 		if (upload + download <= 0 || points >= MEMBERSHIP_USAGE_MAX_POINTS || Math.random() > policy.sampleRate) return;
 		await recordUsage(customerId, upload, download, { engine, transport: 'vless-ws', eventKind: 'close', sampleWeight: 1 / policy.sampleRate, policyVersion: MEMBERSHIP_USAGE_POLICY_VERSION });
 	};
-	return { add, close };
+	const connect = async () => {
+		if (closed || connectRecorded) return;
+		connectRecorded = true;
+		await recordUsage(customerId, 0, 0, { engine, transport: 'vless-ws', eventKind: 'connect', sampleWeight: 1, policyVersion: MEMBERSHIP_USAGE_POLICY_VERSION });
+	};
+	return { add, close, connect };
 }
 function getAdminAuthCookie(request) {
 	const cookies = request.headers.get('Cookie') || '';
@@ -3285,7 +3290,7 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}, env 
 			const 候选UUID = 提取魏烈思UUID(bytes);
 			VLESS连接身份 = await authenticateVlessUuid(env, 候选UUID, yourUUID);
 			if (!VLESS连接身份) throw new Error('VLESS authentication failed');
-			usageTracker = createMembershipUsageTracker(VLESS连接身份.customerId, env);
+			usageTracker ||= createMembershipUsageTracker(VLESS连接身份.customerId, env);
 			const 解析结果 = 解析魏烈思请求(bytes, VLESS连接身份.uuid);
 			if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid 魏烈思 request');
 			const { port, hostname, version, isUDP, rawClientData } = 解析结果;
@@ -3298,6 +3303,7 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}, env 
 				if (port === 53) isDnsQuery = true;
 				else throw new Error('UDP is not supported');
 			}
+			if (VLESS连接身份.kind === 'customer') void usageTracker?.connect()?.catch(() => { });
 			const rawData = rawClientData;
 			if (isDnsQuery) {
 				if (判断是否是木马) return 转发木马UDP数据(rawData, serverSock, 木马UDP上下文, request);
