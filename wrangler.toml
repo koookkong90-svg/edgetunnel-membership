@@ -1,0 +1,11 @@
+name = "magic-membership-restore-2133-pages"
+pages_build_output_dir = "."
+compatibility_date = "2025-11-04"
+
+[[kv_namespaces]]
+binding = "KV"
+id = "b4c8f479d926449c8e347c395ac3be51"
+
+[vars]
+MEMBERSHIP_MODE = "hybrid"
+DEBUG = "false"
