@@ -118,7 +118,9 @@ test('Analytics 采样补偿公式正确（上传/下载/connect）', () => {
 	const query = buildFrequencyBucketQuery({ dataset: DATASET, policyVersion: POLICY_VERSION }, 0, BUCKET_MS * 2);
 	assert.match(query, /SUM\(_sample_interval \* double1 \* double3\) AS uploadBytes/);
 	assert.match(query, /SUM\(_sample_interval \* double2 \* double3\) AS downloadBytes/);
-	assert.match(query, /SUM\(\n\s+IF\(\n\s+blob3 = 'connect',\n\s+_sample_interval \* double4,/);
+	assert.match(query, /sumIf\(_sample_interval \* double4, blob3 = 'connect'\) AS connectCount/);
+	assert.doesNotMatch(query, /SUM\(\s*IF\(/);
+	assert.doesNotMatch(query, /double4,\s*0/);
 });
 
 test('block/interval/close 不计入连接次数（SQL 仅统计 connect）', () => {
