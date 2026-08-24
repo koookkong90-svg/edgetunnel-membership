@@ -787,7 +787,7 @@ function buildFrequencyBucketQuery({ dataset, recordType = MEMBERSHIP_USAGE_RECO
 		'  SUM(_sample_interval * double1 * double3) AS uploadBytes,',
 		'  SUM(_sample_interval * double2 * double3) AS downloadBytes,',
 		"  sumIf(_sample_interval * double4, blob3 = 'connect') AS connectCount,",
-		'  MAX(timestamp) AS latestEventTs',
+		'  toUnixTimestamp(MAX(timestamp)) AS latestEventTs',
 		`FROM ${dataset}`,
 		`WHERE blob1 = '${recordType}'`,
 		`  AND blob2 = '${MEMBERSHIP_USAGE_TRANSPORT}'`,

@@ -110,7 +110,7 @@ test('bucketIndex 使用 Analytics Engine 兼容的 intDiv(toUInt32(timestamp)) 
 	const query = buildFrequencyBucketQuery({ dataset: DATASET, policyVersion: POLICY_VERSION }, 0, BUCKET_MS * 2);
 	assert.match(query, /intDiv\(toUInt32\(timestamp\) - 57600, 43200\) AS bucketIndex/);
 	assert.doesNotMatch(query, /toInt64\(/);
-	assert.doesNotMatch(query, /toUnixTimestamp\(/);
+	assert.doesNotMatch(query, /toUnixTimestamp\(timestamp\)/);
 	assert.doesNotMatch(query, /floor\(/);
 });
 
@@ -121,6 +121,12 @@ test('Analytics 采样补偿公式正确（上传/下载/connect）', () => {
 	assert.match(query, /sumIf\(_sample_interval \* double4, blob3 = 'connect'\) AS connectCount/);
 	assert.doesNotMatch(query, /SUM\(\s*IF\(/);
 	assert.doesNotMatch(query, /double4,\s*0/);
+});
+
+test('latestEventTs 使用 toUnixTimestamp(MAX(timestamp)) 返回整数', () => {
+	const query = buildFrequencyBucketQuery({ dataset: DATASET, policyVersion: POLICY_VERSION }, 0, BUCKET_MS * 2);
+	assert.match(query, /toUnixTimestamp\(MAX\(timestamp\)\) AS latestEventTs/);
+	assert.doesNotMatch(query, /MAX\(timestamp\) AS latestEventTs/);
 });
 
 test('block/interval/close 不计入连接次数（SQL 仅统计 connect）', () => {
@@ -164,6 +170,14 @@ test('多个客户能在同一 SQL 结果中解析', () => {
 	assert.equal(customerA.buckets[0].bucketStartMs, bucketA * BUCKET_MS + 16 * 3600 * 1000);
 	assert.equal(customerA.buckets[0].bucketEndMs, (bucketA + 1) * BUCKET_MS + 16 * 3600 * 1000);
 	assert.equal(customerA.latestEventMs, 3000 * 1000);
+});
+
+test('整数 latestEventTs 行不会被跳过（回归：DateTime 字符串曾导致 customerCount=0）', () => {
+	const buckets = parseFrequencyBucketRows([
+		{ customerId: CUSTOMER_A, bucketIndex: 41375, uploadBytes: 100, downloadBytes: 200, connectCount: 3, latestEventTs: 1787500800 },
+	]);
+	assert.equal(buckets.length, 1);
+	assert.equal(buckets[0].latestEventMs, 1787500800000);
 });
 
 test('connect 事件计入连接次数；零字节不影响流量总量', () => {
