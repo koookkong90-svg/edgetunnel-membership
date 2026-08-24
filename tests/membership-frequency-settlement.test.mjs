@@ -370,6 +370,38 @@ test('相同 cutoff 重复运行不重复累计', async () => {
 	assert.equal(afterSecond.settledUsedBytes, 100, '重复运行不得重复累计');
 });
 
+test('同 cutoff 重跑不重复累计（结算后状态：watermark=cutoff、revision=2）', async () => {
+	const CUTOFF_REAL = 1787544000000;
+	const NOW_REAL = 1787560200000; // 北京 2026-08-24 14:30，delay=2 → cutoff 12:00
+	const CUSTOMER_C = 'cus_cccccccccccccccccccc';
+	const state = [
+		{ id: CUSTOMER_A, used: 96931150 },
+		{ id: CUSTOMER_B, used: 3146030 },
+		{ id: CUSTOMER_C, used: 8048700 },
+	];
+	const usage = {};
+	for (const s of state) {
+		usage[s.id] = makeUsage(s.id, { settledUsedBytes: s.used, usageSettledThrough: CUTOFF_REAL, revision: 2 });
+	}
+	const env = makeEnv({ usage });
+	const fetchImpl = createFetch(() => groupedRows(
+		state.map(s => bucketRow(s.id, { startMs: CUTOFF_REAL - 12 * 3600 * 1000, upload: s.used, download: 0, connect: 12 })),
+	));
+	const result = await run(env, fetchImpl, NOW_REAL);
+	assert.equal(result.ok, true);
+	assert.equal(result.cutoffMs, CUTOFF_REAL);
+	assert.equal(result.customerCount, 3);
+	assert.equal(result.settledCount, 0);
+	assert.ok(result.results.every(r => r.reason === 'already_settled'));
+	assert.equal(usagePuts(env.KV), 0);
+	for (const s of state) {
+		const after = jsonParse(env.KV._store.get(USAGE_KEY + s.id));
+		assert.equal(after.settledUsedBytes, s.used);
+		assert.equal(after.usageSettledThrough, CUTOFF_REAL);
+		assert.equal(after.revision, 2);
+	}
+});
+
 // ---------------------------------------------------------------------------
 // KV 压力与失败隔离
 // ---------------------------------------------------------------------------
