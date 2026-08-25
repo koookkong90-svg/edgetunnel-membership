@@ -249,6 +249,10 @@ export function renderAdminMembersPage() {
 			if (!hasExactFields(value, ['customer'])) throw new Error('invalid_response');
 			return { customer: validateCustomer(value.customer) };
 		}
+		function validateDeleteResult(value) {
+			if (!isPlainObject(value) || Object.keys(value).length !== 1 || value.deleted !== true) throw new Error('invalid_response');
+			return value;
+		}
 		function validateCreatePayload(value) {
 			if (!hasExactFields(value, ['customer','rawToken','subscriptionUrl','secretReturnedOnce']) || value.secretReturnedOnce !== true) throw new Error('invalid_response');
 			if (typeof value.rawToken !== 'string' || !/^[A-Za-z0-9_-]{43,512}$/.test(value.rawToken) || typeof value.subscriptionUrl !== 'string' || value.subscriptionUrl.length > 4096) throw new Error('invalid_response');
@@ -282,6 +286,7 @@ export function renderAdminMembersPage() {
 			const code = isPlainObject(payload?.error) && typeof payload.error.code === 'string' ? payload.error.code : '';
 			if (status === 503 && code === 'partial_update') return '套餐更新未完整完成，请刷新客户数据后重试';
 			if (status === 400) return '请求内容有误，请检查后重试';
+			if (status === 400 && code === 'invalid_confirmation') return '确认内容不正确，已取消删除';
 			if (status === 403) return '安全校验失败，请刷新页面后重试';
 			if (status === 404) return '客户不存在或已被删除';
 			if (status === 405) return '页面与服务端版本不匹配';
@@ -291,6 +296,7 @@ export function renderAdminMembersPage() {
 			if (status === 409 && code === 'create_in_progress') return '客户正在创建中，请稍后使用相同表单重试';
 			if (status === 409 && code === 'idempotency_conflict') return '本次创建请求已失效，请修改表单后重试';
 			if (status === 409 && code === 'revision_conflict') return '客户资料已被其他操作更新，请刷新列表后重试';
+			if (status === 409 && code === 'customer_not_disabled') return '只能删除已停用的客户';
 			if (status === 409) return '客户状态冲突，请刷新列表后重试';
 			if (status === 413) return '请求内容过大';
 			if (status === 415) return '请求格式异常';
@@ -298,7 +304,7 @@ export function renderAdminMembersPage() {
 			return '操作失败，请稍后重试';
 		}
 		function safeMutationErrorMessage(error) {
-			const allowed = new Set(['请求内容有误，请检查后重试','安全校验失败，请刷新页面后重试','客户不存在或已被删除','页面与服务端版本不匹配','客户尚未激活','该记录需要迁移','不限流量客户无需增加额度，请先设置有限额度','客户正在创建中，请稍后使用相同表单重试','本次创建请求已失效，请修改表单后重试','客户资料已被其他操作更新，请刷新列表后重试','客户状态冲突，请刷新列表后重试','请求内容过大','请求格式异常','服务暂时异常，请稍后重试','操作失败，请稍后重试','服务返回的数据格式异常，请稍后重试']);
+			const allowed = new Set(['请求内容有误，请检查后重试','安全校验失败，请刷新页面后重试','客户不存在或已被删除','页面与服务端版本不匹配','客户尚未激活','该记录需要迁移','不限流量客户无需增加额度，请先设置有限额度','客户正在创建中，请稍后使用相同表单重试','本次创建请求已失效，请修改表单后重试','客户资料已被其他操作更新，请刷新列表后重试','客户状态冲突，请刷新列表后重试','请求内容过大','请求格式异常','服务暂时异常，请稍后重试','操作失败，请稍后重试','只能删除已停用的客户','确认内容不正确，已取消删除','服务返回的数据格式异常，请稍后重试']);
 			return allowed.has(error?.message) ? error.message : '操作失败，请稍后重试';
 		}
 		function handleUnauthorized() {
@@ -379,7 +385,7 @@ export function renderAdminMembersPage() {
 		function formatTrafficBytes(value) {
 			if (!Number.isSafeInteger(value) || value < 0) return '流量异常';
 			const gib = value / GIB_BYTES;
-			return (gib >= 100 ? gib.toFixed(0) : gib >= 10 ? gib.toFixed(1) : gib.toFixed(2)).replace(/\.0+$/, '') + ' GiB';
+			return (gib >= 100 ? gib.toFixed(0) : gib >= 10 ? gib.toFixed(1) : gib.toFixed(2)).replace(/\\.0+$/, '') + ' GiB';
 		}
 		function formatUsageUpdatedAt(value) {
 			return value === 0 ? '尚未结算' : formatLocalTime(value);
@@ -555,6 +561,9 @@ function createActionsCell(customer) {
 			if (customer.state === 'active' && !customer.timeInvalid) {
 				const targetEnabled = !customer.enabled;
 				actions.appendChild(createActionButton(targetEnabled ? '\u542f\u7528' : '\u505c\u7528', targetEnabled ? 'secondary' : 'danger', busy, () => { void toggleCustomer(customer.customerId, targetEnabled); }));
+			}
+			if (customer.state === 'active' && customer.enabled === false && customer.disableReason === 'manual') {
+				actions.appendChild(createActionButton('\u6c38\u4e45\u5220\u9664', 'danger', busy, () => { void deleteCustomer(customer.customerId); }));
 			}
 			actions.appendChild(createActionButton('\u590d\u5236UUID', 'secondary', false, () => { void copyTextSafely(customer.uuid, 'UUID\u5df2\u590d\u5236'); }));
 			cell.appendChild(actions);
@@ -819,6 +828,35 @@ function createActionsCell(customer) {
 				showMessage(enabled ? '客户已启用' : '客户已停用', 'info');
 			} catch (error) {
 				if (error.message !== 'redirecting') showMessage(safeMutationErrorMessage(error) + '，原状态已保留，必要时请刷新列表确认', 'error');
+			} finally {
+				customerOperations.delete(customerId);
+				renderAll();
+			}
+		}
+		async function deleteCustomer(customerId) {
+			const customer = customersById.get(customerId);
+			if (!customer || customer.state !== 'active' || customer.enabled !== false || customer.disableReason !== 'manual' || customerOperations.has(customerId)) return;
+			const expectedConfirm = String(customer.name || '').trim() === '' ? '永久删除' : customer.name;
+			const input = window.prompt('永久删除警告：\\n订阅将立即失效；\\n客户记录与流量记录将被永久删除；\\n此操作不可恢复。\\n请输入客户名称以确认：', '');
+			if (input === null) return;
+			const confirmText = String(input).trim();
+			if (confirmText !== expectedConfirm) {
+				showMessage('确认内容不正确，已取消删除', 'error');
+				return;
+			}
+			if (!window.confirm('再次确认：将永久删除该客户及其全部关联记录，此操作不可恢复。确定继续吗？')) return;
+			customerOperations.set(customerId, 'delete');
+			clearMessage();
+			renderAll();
+			try {
+				await mutationRequest('/admin/api/customers/' + encodeURIComponent(customerId), 'DELETE', { expectedRevision:customer.revision, confirmName:confirmText }, 200, validateDeleteResult);
+				const index = customerOrder.indexOf(customerId);
+				if (index !== -1) customerOrder.splice(index, 1);
+				customersById.delete(customerId);
+				if (packageCustomerId === customerId) closePackagePanel();
+				showMessage('客户已永久删除', 'info');
+			} catch (error) {
+				if (error.message !== 'redirecting') showMessage(safeMutationErrorMessage(error), 'error');
 			} finally {
 				customerOperations.delete(customerId);
 				renderAll();

@@ -20,6 +20,10 @@ GRAINTCP_*
 wrangler-install.log
 wrangler.membership-test.toml
 
+# 本地正式配置（禁止提交到任何仓库）
+wrangler.prod.toml
+wrangler.settlement.prod.toml
+
 # IDE
 .vscode/
 .idea/

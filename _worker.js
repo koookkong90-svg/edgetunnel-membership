@@ -911,6 +911,15 @@ async function putCustomerUsageRecord(env, customer) {
 	return parsed;
 }
 
+async function deleteMembershipRecord(env, key) {
+	if (!env?.KV || typeof env.KV.delete !== 'function') throw createAdminCustomerError('kv_unavailable');
+	try {
+		await env.KV.delete(key);
+	} catch (_) {
+		throw createAdminCustomerError('kv_failed');
+	}
+}
+
 async function persistCustomerBaseMutation(env, originalCustomer, updatedCustomer) {
 	const original = validateCustomerAdminRecord(originalCustomer), updated = validateCustomerAdminRecord(updatedCustomer);
 	if (original.schemaVersion !== 4) await putCustomerUsageRecord(env, original);
@@ -992,7 +1001,7 @@ function validateAdminBodyFields(body, allowedFields, requiredFields = []) {
 
 async function handleAdminCustomerApi(request, env, route, legacyContext) {
 	const method = request.method.toUpperCase();
-	const allowed = route.route === 'customers' ? ['GET', 'POST'] : route.route === 'customer_detail' ? ['PATCH'] : ['POST'];
+	const allowed = route.route === 'customers' ? ['GET', 'POST'] : route.route === 'customer_detail' ? ['PATCH', 'DELETE'] : ['POST'];
 	if (!allowed.includes(method)) return createAdminApiResponse({ error: { code: 'method_not_allowed', message: 'Method not allowed' } }, 405);
 
 	let body = null;
@@ -1003,7 +1012,11 @@ async function handleAdminCustomerApi(request, env, route, legacyContext) {
 		if (!parsedBody.ok) return parsedBody.response;
 		body = parsedBody.value;
 	}
-	const requiredKvMethods = route.route === 'customers' && method === 'GET' ? ['get', 'list'] : ['get', 'put'];
+	const requiredKvMethods = route.route === 'customers' && method === 'GET'
+		? ['get', 'list']
+		: route.route === 'customer_detail' && method === 'DELETE'
+			? ['get', 'put', 'delete']
+			: ['get', 'put'];
 	if (!env?.KV || requiredKvMethods.some(kvMethod => typeof env.KV[kvMethod] !== 'function')) return createAdminApiResponse({ error: { code: 'service_unavailable', message: 'Membership customer service is temporarily unavailable' } }, 503);
 
 	try {
@@ -1136,6 +1149,24 @@ async function handleAdminCustomerApi(request, env, route, legacyContext) {
 			const succeededRecord = { ...processingRecord, state: 'succeeded', updatedAt: Date.now(), encryptedResult: await encryptCreateRequestResult(legacyContext, idempotencyKey, result) };
 			await putCreateResultRecord(env, idempotencyKey, succeededRecord);
 			return createAdminApiResponse(result, 201);
+		}
+
+		if (route.route === 'customer_detail' && method === 'DELETE') {
+			validateAdminBodyFields(body, ['expectedRevision', 'confirmName'], ['expectedRevision', 'confirmName']);
+			const originalCustomer = await loadCustomerById(env, route.customerId);
+			if (!originalCustomer) return createAdminApiResponse({ error: { code: 'not_found', message: 'Customer not found' } }, 404);
+			validateExpectedRevision(body.expectedRevision, originalCustomer.revision);
+			if (originalCustomer.state !== 'active' || originalCustomer.enabled !== false || originalCustomer.disableReason !== 'manual') throw createAdminCustomerError('customer_not_disabled');
+			const expectedConfirm = String(originalCustomer.name || '').trim() === '' ? '永久删除' : originalCustomer.name;
+			if (String(body.confirmName ?? '') !== expectedConfirm) throw createAdminCustomerError('invalid_confirmation');
+			const parsed = parseMembershipCustomer(originalCustomer);
+			// 删除顺序：先删访问指针（UUID/Token），再删 usage 记录，最后删主记录。
+			// 任一步失败后重试仍安全（重复删除不存在的键是无害空操作）。
+			await deleteMembershipRecord(env, MEMBERSHIP_UUID_KEY_PREFIX + parsed.uuid);
+			await deleteMembershipRecord(env, MEMBERSHIP_TOKEN_KEY_PREFIX + parsed.tokenHash);
+			await deleteMembershipRecord(env, MEMBERSHIP_USAGE_KEY_PREFIX + parsed.customerId);
+			await deleteMembershipRecord(env, MEMBERSHIP_CUSTOMER_KEY_PREFIX + parsed.customerId);
+			return createAdminApiResponse({ deleted: true }, 200);
 		}
 
 		if (route.route === 'customer_detail') {
@@ -1284,6 +1315,8 @@ async function handleAdminCustomerApi(request, env, route, legacyContext) {
 		if (error?.code === 'revision_conflict') return createAdminApiResponse({ error: { code: 'revision_conflict', message: 'Customer record revision has changed' } }, 409);
 		if (error?.code === 'idempotency_conflict') return createAdminApiResponse({ error: { code: 'idempotency_conflict', message: 'Idempotency key was already used for a different request' } }, 409);
 		if (error?.code === 'quota_unlimited') return createAdminApiResponse({ error: { code: 'quota_unlimited', message: 'Unlimited traffic customer has no finite quota to increase' } }, 409);
+		if (error?.code === 'customer_not_disabled') return createAdminApiResponse({ error: { code: 'customer_not_disabled', message: '只能删除已停用的客户' } }, 409);
+		if (error?.code === 'invalid_confirmation') return createAdminApiResponse({ error: { code: 'invalid_confirmation', message: '确认内容不正确，已取消删除' } }, 400);
 		if (error?.code === 'partial_update') return createAdminApiResponse({ error: { code: 'partial_update', message: 'Package update was not completed; refresh customer data' } }, 503);
 		if (error?.code === 'migration_required') return createAdminApiResponse({ error: { code: 'migration_required', message: 'Customer record requires migration' } }, 409);
 		return createAdminApiResponse({ error: { code: 'service_unavailable', message: 'Membership customer service is temporarily unavailable' } }, 503);
